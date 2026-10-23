@@ -145,6 +145,46 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: /architecture\.md/ })).toBeTruthy()
   })
 
+  it('creates a note from the sidebar and opens it', async () => {
+    const created = {
+      path: 'idea.md',
+      name: 'idea.md',
+      title: 'idea',
+      modifiedMs: null,
+    }
+    let listings = 0
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'list_notes') {
+        listings += 1
+        return Promise.resolve(listings === 1 ? notes : [...notes, created])
+      }
+      if (command === 'create_note') return Promise.resolve(created)
+      if (command === 'read_note') {
+        return Promise.resolve({ content: '', revision: 'rev-new' })
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`))
+    })
+
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: '打开 Markdown 文件夹' }))
+    await screen.findByText('hello.md')
+
+    await user.type(screen.getByLabelText('新笔记名称'), 'idea')
+    await user.click(screen.getByRole('button', { name: '新建' }))
+
+    expect(mocks.invoke).toHaveBeenCalledWith('create_note', {
+      root: 'C:\\notes',
+      title: 'idea',
+    })
+    expect(await screen.findByRole('button', { name: /idea\.md/ })).toBeTruthy()
+
+    const editor = (await screen.findByLabelText('Markdown 编辑器')) as HTMLTextAreaElement
+    expect(editor.value).toBe('')
+    expect((screen.getByLabelText('新笔记名称') as HTMLInputElement).value).toBe('')
+  })
+
   it('flushes pending edits before the window closes', async () => {
     const { user, editor } = await openFirstNote()
 

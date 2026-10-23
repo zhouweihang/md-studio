@@ -201,7 +201,7 @@ pub fn search_cancel(request_id: u64);
 
 | REQ | 验收方式 | 当前状态 |
 |---|---|---|
-| REQ-022 | 1k 基准 ≥10% 提升；匹配语义用例全绿 | 待实现（plan Task 2） |
+| REQ-022 | 1k 基准 ≥10% 提升；匹配语义用例全绿 | **通过 2026-10-23**：暖 p50 1k −30.1%、10k −28.9%、50k −26.6%；`aho-corasick` ASCII 匹配、按需片段、排序 key 预计算、搜索路径去 canonicalize；Rust 26 passed |
 | REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | 待实现（plan Task 3） |
 | REQ-024 | 10k 暖查询 p95 ≤20 ms；LRU 单测 | 待实现（plan Task 4） |
 | REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | 待实现（plan Task 4） |
@@ -209,7 +209,7 @@ pub fn search_cancel(request_id: u64);
 | REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | 待实现（plan Task 6） |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |
 | REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | 待实现（plan Task 5） |
-| REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | 部分完成：脚本与基线已入库（暖 p50 1k 415.5 ms / 10k 4.05 s / 50k 20.28 s）；回归门禁待 Task 8 |
+| REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | **通过 2026-10-23**：基线入库；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 自检均通过；基准不进 CI |
 
 验收前必须跑：`bun run test`、`bun run typecheck`、`bun run build`、`cargo test --locked --all-targets`、`bun run tauri build`、`node scripts/check-eng-docs.cjs`。性能数字一律以 release 为准，并记录机器档位（spec §10.3）。
 

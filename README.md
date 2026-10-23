@@ -38,6 +38,7 @@ bun run test           # Vitest：core / application / markdown 适配器
 bun run typecheck      # tsc --noEmit
 bun run build          # 前端生产构建
 bun run check:docs     # RFC / ADR / C4 / spec / plan / backlog 门禁
+bun run check:perf     # 最新基准结果对比基线：中位数 ≤1.2×、p95 ≤2×
 cd src-tauri && cargo test
 ```
 

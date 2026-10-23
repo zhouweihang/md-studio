@@ -1994,6 +1994,7 @@ dependencies = [
 name = "md-studio"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "serde",
  "serde_json",
  "tauri",

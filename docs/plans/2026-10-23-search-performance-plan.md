@@ -59,14 +59,14 @@
 
 **Files:** `src-tauri/src/search.rs`、`src-tauri/src/notes.rs`（`list_notes` 排序）
 
-- [ ] **Step 1**: 先补测试：ASCII 大小写、中文、多匹配、无匹配、片段边界、`list_notes` 排序稳定性。
-- [ ] **Step 2**: 排序 key 预计算 + `sort_by_cached_key`。
-- [ ] **Step 3**: 全 ASCII needle 走 `aho-corasick` 的 `ascii_case_insensitive`；非 ASCII 保留 `to_lowercase` 语义。
-- [ ] **Step 4**: preview 用 `char_indices` 切片，仅命中行生成。
-- [ ] **Step 5**: 搜索路径去掉重复 `canonicalize`，补一条路径边界测试证明仍拒绝逃逸。
-- [ ] **Step 6**: `cargo test --locked --all-targets`；`bench_search` 对比基线，记录提升百分比。
+- [x] **Step 1**: 先补测试：ASCII 大小写、中文、多匹配、无匹配、片段省略号、路径边界、`list_notes` 排序。
+- [x] **Step 2**: 排序 key 预计算 + `sort_by_cached_key`（`notes.rs`）。
+- [x] **Step 3**: 全 ASCII needle 走 `aho-corasick` 的 `ascii_case_insensitive`；非 ASCII 保留 `to_lowercase` 语义。
+- [x] **Step 4**: preview 用 `char_indices` 切片，仅命中行生成，不再 `Vec<char>` 全行拷贝。
+- [x] **Step 5**: 搜索路径去掉重复 `canonicalize`，改为词法校验 + `symlink_metadata` 拒绝符号链接；`search_target_rejects_traversal_absolute_and_non_markdown` 覆盖。
+- [x] **Step 6**: `cargo test --locked --all-targets`（26 passed）；`bench_search` 对比基线：1k −30.1%、10k −28.9%、50k −26.6%（暖 p50）。
 
-**验收**：1k 档 release 比基线下降 ≥10%；所有匹配语义用例与黄金结果一致。
+**验收**：1k 暖 p50 415.5 → 290.3 ms（−30.1%），远超 ≥10% 目标；匹配语义、中文、大小写与片段用例全绿。
 
 ## Task 3: L1 并行扫描（REQ-023）
 
@@ -137,7 +137,7 @@
 - [ ] **Step 2**: `bun run typecheck`、`bun run test`、`bun run build`。
 - [ ] **Step 3**: `cargo test --locked --all-targets`。
 - [ ] **Step 4**: `bun run tauri build`（NSIS，记录体积）。
-- [ ] **Step 5**: 三档基准刷新基线，确认 1.2× 中位数 / 2× p95 门禁可判定。
+- [x] **Step 5**: 门禁脚本 `check-search-perf.mjs` 已实现，并用基线自检 PASS 与 FAIL 两条路径；基准仍不进 CI。
 - [ ] **Step 6**: 回填 RFC-006 §6/§8、README、knowledge.md、C3、backlog 状态。
 
 ---

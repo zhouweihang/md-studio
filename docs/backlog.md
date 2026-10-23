@@ -30,7 +30,7 @@
 | ID | 项 | 证据 | 现状 | 收尾标准 |
 |---|---|---|---|---|
 | B2-1 | 原子写入 | `notes.rs` 计划用 `fs::write` | 写入中断可能留下截断文件 | 同目录临时文件 + rename；Windows 覆盖策略单测 |
-| B2-2 | UI 组件测试 | `src/ui/App.test.tsx`、`src/ui/NoteDialog.test.tsx` | **部分完成 2026-10-23**：已引入 Testing Library，12 个 UI 用例覆盖空态、打开/编辑/预览、文件名过滤、内容命中高亮、关闭前 flush、冲突横幅/覆盖/重载、删除确认与回收站撤销、重命名、Escape；**缺新建流程用例**（原「只测 core/application/adapters」的描述已过时） | 补「新建笔记 → 出现在树 → 可编辑」用例后关闭 |
+| ~~B2-2~~ | UI 组件测试 | `src/ui/App.test.tsx`、`src/ui/NoteDialog.test.tsx` | **Completed 2026-10-23**：Testing Library 共 13 个 UI 用例（App 10 + NoteDialog 3），覆盖空态、打开/编辑/预览、文件名过滤、内容命中高亮、关闭前 flush、冲突横幅/覆盖/重载、删除确认与回收站撤销、重命名、Escape，以及「新建 → 出现在树 → 打开为空编辑器」 | 引入 Testing Library，覆盖空态、搜索、新建、保存失败提示 |
 | ~~B2-3~~ | 文档门禁进 CI | `.github/workflows/ci.yml` 的 `docs` job | **Completed 2026-10-23**：push/PR 自动执行 `node scripts/check-eng-docs.cjs` | CI 在 PR 上运行 `bun run check:docs`，失败阻断合并 |
 | B2-4 | 跨平台路径测试 | 仅在 Windows 开发 | macOS/Linux 未验证 | CI 矩阵跑 `cargo test` 与 `bun run test` |
 | ~~B2-5~~ | 搜索性能基线 | RFC-005 §4.2；ADR-004 | **Completed 2026-10-23**：1,001 篇笔记搜索实测 330.97ms（debug），测试断言 <10s 并打印耗时。RFC-006 将用三档基准与分机器基线取代单一护栏（见搜索基准条目） | 1,000 篇工作区有可重复耗时断言，数量级退化会被发现 |
@@ -46,12 +46,12 @@
 
 | ID | 项 | 证据 | 现状 | 收尾标准 |
 |---|---|---|---|---|
-| B4-1 | L0 扫描热点优化 | RFC-006 §4.2；REQ-022 | 未开始 | 1k 档 release 比 313 ms 基线下降 ≥10%；匹配语义与黄金结果一致 |
+| ~~B4-1~~ | L0 扫描热点优化 | RFC-006 §4.2；REQ-022 | **Completed 2026-10-23**：aho-corasick ASCII 免分配匹配、按需片段、排序 key 预计算、搜索路径去 canonicalize；暖 p50 1k 415.5→290.3 ms（−30.1%）、10k 4050.8→2880.8 ms（−28.9%）、50k 20279.5→14881.8 ms（−26.6%） | 1k 档 release 比基线下降 ≥10%；匹配语义与黄金结果一致 |
 | B4-2 | L1 并行扫描 | RFC-006 §4.3；REQ-023 | 未开始 | 1k 档 ≤120 ms（本机 release）；结果集与串行逐条一致 |
 | B4-3 | L2 内存快照 + LRU | RFC-006 §4.4；ADR-007；REQ-024 | 未开始 | 10k 档暖查询 p95 ≤20 ms；256 MB 预算下淘汰不改结果 |
 | B4-4 | 后台预热与状态机 | RFC-006 §4.4；REQ-025 | 未开始 | 打开工作区不阻塞；`Warming/Ready/Degraded` 可见；失败回退实时扫描 |
 | B4-5 | 流式搜索契约 | RFC-006 §4.5；ADR-008；REQ-026 | 未开始 | 旧 `search_notes` 退役；逐批渲染；取消无迟到副作用 |
 | B4-6 | 文件监听 + mtime 兜底 | RFC-006 §4.6；ADR-009；REQ-027 | 未开始（承接文件监听遗留项） | 外部编辑 500 ms 内可见；监听失败自动降级 |
 | B4-7 | 50k 上限 + 侧栏虚拟化 | RFC-006 §4.7；REQ-028 | 未开始 | 50k 工作区可打开、可搜索；树虚拟化；键盘与无障碍不回归 |
-| B4-8 | 基准脚本 + 基线门禁 | RFC-006 §10；REQ-030 | **进行中 2026-10-23**：`gen-search-corpus`/`bench-search`/`bench_search` 已就绪，基线已入库（暖 p50 1k 415.5 ms、10k 4.05 s、50k 20.28 s）；回归门禁未接 | 1k/10k/50k 可复现；基线 JSON 入库；1.2× 中位数 / 2× p95 可判定 |
+| ~~B4-8~~ | 基准脚本 + 基线门禁 | RFC-006 §10；REQ-030 | **Completed 2026-10-23**：语料生成器、`bench_search`、编排脚本与基线入库（暖 p50 1k 415.5 ms、10k 4.05 s、50k 20.28 s）；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 两条路径已自检 | 1k/10k/50k 可复现；基线 JSON 入库；1.2× 中位数 / 2× p95 可判定 |
 | B4-9 | L3 触发评估（ADR-010） | spec §5 L3 | 未开始 | 触发条件成文，附候选对比维度；不实现索引 |

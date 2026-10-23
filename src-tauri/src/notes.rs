@@ -75,7 +75,7 @@ pub(crate) fn canonical_root(root: &str) -> AppResult<PathBuf> {
     Ok(canonical)
 }
 
-fn relative_note_path(relative: &str) -> AppResult<PathBuf> {
+pub(crate) fn relative_note_path(relative: &str) -> AppResult<PathBuf> {
     if relative.trim().is_empty() {
         return Err("note path is empty".to_string());
     }
@@ -104,7 +104,7 @@ fn relative_note_path(relative: &str) -> AppResult<PathBuf> {
     Ok(clean)
 }
 
-fn ensure_within(root: &Path, path: &Path) -> AppResult<()> {
+pub(crate) fn ensure_within(root: &Path, path: &Path) -> AppResult<()> {
     if path.starts_with(root) {
         Ok(())
     } else {
@@ -297,12 +297,9 @@ pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
     let root = canonical_root(&root)?;
     let mut notes = Vec::new();
     walk(&root, &root, 0, &mut notes)?;
-    notes.sort_by(|left, right| {
-        left.path
-            .to_ascii_lowercase()
-            .cmp(&right.path.to_ascii_lowercase())
-            .then_with(|| left.path.cmp(&right.path))
-    });
+    // Precompute the lowercase key once per note instead of allocating twice
+    // on every comparison.
+    notes.sort_by_cached_key(|note| (note.path.to_ascii_lowercase(), note.path.clone()));
     Ok(notes)
 }
 
@@ -515,6 +512,18 @@ mod tests {
         assert_eq!(paths, vec!["alpha.md", "sub/beta.markdown"]);
         assert_eq!(notes[1].title, "beta");
         assert!(notes[0].modified_ms.is_some());
+    }
+
+    #[test]
+    fn list_notes_sorts_case_insensitively() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(root, "Banana.md", "b");
+        write_file(root, "apple.md", "a");
+
+        let notes = list_notes(root.to_string_lossy().into_owned()).unwrap();
+        let paths: Vec<_> = notes.iter().map(|note| note.path.as_str()).collect();
+        assert_eq!(paths, vec!["apple.md", "Banana.md"]);
     }
 
     #[test]
