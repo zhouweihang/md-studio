@@ -1,0 +1,10 @@
+{
+  "adrDir": "docs/adr",
+  "rfcDir": "docs/rfc",
+  "architectureDir": "docs/architecture",
+  "specsDir": "docs/specs",
+  "plansDir": "docs/plans",
+  "backlogFile": "docs/backlog.md",
+  "adrIndex": "docs/adr/README.md",
+  "gateCommand": "node scripts/check-eng-docs.cjs"
+}
