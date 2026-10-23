@@ -45,13 +45,15 @@
 
 **Files:** `scripts/gen-search-corpus.mjs`、`scripts/bench-search.mjs`、`src-tauri/src/bin/bench_search.rs`、`docs/perf/baseline/dev-i9-14900hx.json`
 
-- [ ] **Step 1**: 语料生成器：固定种子，三档 1k/10k/50k；大小分布 70% 2–8 KB、20% 8–32 KB、10% 32–256 KB；30% 中文正文；含少量 5 MiB 边界文件。
-- [ ] **Step 2**: 把 `search_notes_blocking` 从 `notes.rs` 抽到 `src/search.rs`，`notes.rs` 只保留命令封装；`cargo test` 全绿（现有 22 个用例不变）。
-- [ ] **Step 3**: `bench_search` 输出 `{ coldMs, warmP50Ms, warmP95Ms, peakRssMb, cachedBytes, hits }`，支持 `--repeat/--warmup/--json`。
-- [ ] **Step 4**: 采集改造前基线（1k / 10k / 50k），写入 `docs/perf/baseline/dev-i9-14900hx.json`。
-- [ ] **Step 5**: `cargo run --release --bin bench_search -- --root <corpus-1k> --query needle --json` 可复现。
+- [x] **Step 1**: 语料生成器：固定种子，三档 1k/10k/50k；大小分布 70% 2–8 KB、20% 8–32 KB、10% 32–256 KB；30% 中文正文；含一个 5 MiB 边界文件。
+- [x] **Step 2**: 把 `search_notes_blocking` 从 `notes.rs` 抽到 `src/search.rs`，`notes.rs` 只保留命令封装；`cargo test` 全绿（22 passed）。
+- [x] **Step 3**: `bench_search` 输出 `{ coldMs, warmP50Ms, warmP95Ms, warmMinMs, warmMaxMs, hits, runs }`（`peakRssMb` 暂为 null，待 L2 增加 RSS 采集），支持 `--repeat/--warmup/--json`。
+- [x] **Step 4**: 采集改造前基线（1k / 10k / 50k），写入 `docs/perf/baseline/dev-i9-14900hx.json`。
+- [x] **Step 5**: `cargo run --release --bin bench_search -- --root <corpus-1k> --query needle --json` 可复现。
 
-**验收**：基线与 spec §2.2 的 313 ms 同量级；三档语料可重复生成（同一路径）。
+**验收**：基线已入库——暖 p50 1k 415.5 ms、10k 4.05 s、50k 20.28 s；冷启动 415.9 ms / 4.08 s / 20.19 s。1k 高于 spec §2.2 的 313 ms 是因为本语料 27.2 MiB（spec 语料约 0.32 MiB），属预期差异。
+
+**备注**：为采集 50k，`MAX_NOTES` 已提前提升到 50,000（Task 7 仍负责侧栏虚拟化与 UI 测试）；语料位于 `md-studio/target/bench-corpus/`（已忽略）。
 
 ## Task 2: L0 热点优化（REQ-022）
 
@@ -121,7 +123,7 @@
 
 **Files:** `src-tauri/src/notes.rs`、`src/ui/Sidebar.tsx`、`src/ui/app.css`、测试文件
 
-- [ ] **Step 1**: `MAX_NOTES` 改 50,000；补上限测试与超限错误信息。
+- [ ] **Step 1**: `MAX_NOTES` 已在 Task 1 提前改为 50,000；仍需补上限测试与超限错误信息。
 - [ ] **Step 2**: 侧栏固定行高窗口化（24 px、overscan 20、`ResizeObserver`、可注入 `viewportHeight`）。
 - [ ] **Step 3**: 目录默认折叠；搜索过滤只渲染匹配项；保留 `tree/treeitem` 与键盘导航。
 - [ ] **Step 4**: 50k 语料打开工作区计时；IPC 体积与树构建耗时记录到 plan 或 RFC。

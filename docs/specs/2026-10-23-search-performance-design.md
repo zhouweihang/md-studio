@@ -382,14 +382,18 @@ searchNotes(
 {
   "tier": "dev-i9-14900hx",
   "capturedAt": "2026-10-23",
-  "machine": { "cpu": "i9-14900HX", "cores": 24, "ramGb": 47.7, "disk": "SSD", "osBuild": "26300" },
-  "toolchain": { "rustc": "1.96.0", "profile": "release" },
-  "corpus": { "notes": 10000, "bytes": 41943040 },
-  "metrics": { "coldMs": null, "warmP50Ms": null, "warmP95Ms": null, "peakRssMb": null }
+  "machine": { "cpu": "Intel(R) Core(TM) i9-14900HX", "cores": 32, "ramGb": 47.7, "os": "win32 10.0.26300" },
+  "toolchain": { "rustc": "rustc 1.96.0", "profile": "release" },
+  "query": "needle",
+  "results": {
+    "1000":  { "notes": 1000,  "bytes": 28573385,   "coldMs": 415.9,   "warmP50Ms": 415.5,   "warmP95Ms": 428.4,   "runs": 30 },
+    "10000": { "notes": 10000, "bytes": 225788729,  "coldMs": 4076.3,  "warmP50Ms": 4050.8,  "warmP95Ms": 4087.4,  "runs": 20 },
+    "50000": { "notes": 50000, "bytes": 1138251705, "coldMs": 20193.3, "warmP50Ms": 20279.5, "warmP95Ms": 20526.7, "runs": 10 }
+  }
 }
 ```
 
-首轮实测前数值留空；填入后门禁才启用。
+首轮实测已填入（2026-10-23，改造前）；后续变化按 §3.3 的倍率门禁比较。`peakRssMb` 暂缺，待 L2 增加内存采集。
 
 机器档位命名（§14 Q8）：`dev-<cpu 短名>`、`ci-<runner 名>`；首轮只建 `dev-i9-14900hx` 一档，CI runner 档在手动基准 job 首次跑通后补建。不同档位之间不比较，只与各自历史基线比较。
 

@@ -209,7 +209,7 @@ pub fn search_cancel(request_id: u64);
 | REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | 待实现（plan Task 6） |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |
 | REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | 待实现（plan Task 5） |
-| REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | 待实现（plan Task 1/8） |
+| REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | 部分完成：脚本与基线已入库（暖 p50 1k 415.5 ms / 10k 4.05 s / 50k 20.28 s）；回归门禁待 Task 8 |
 
 验收前必须跑：`bun run test`、`bun run typecheck`、`bun run build`、`cargo test --locked --all-targets`、`bun run tauri build`、`node scripts/check-eng-docs.cjs`。性能数字一律以 release 为准，并记录机器档位（spec §10.3）。
 

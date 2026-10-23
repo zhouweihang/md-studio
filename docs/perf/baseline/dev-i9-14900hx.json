@@ -1,0 +1,67 @@
+{
+  "tier": "dev-i9-14900hx",
+  "capturedAt": "2026-10-23",
+  "machine": {
+    "cpu": "Intel(R) Core(TM) i9-14900HX",
+    "cores": 32,
+    "ramGb": 47.7,
+    "os": "win32 10.0.26300"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "profile": "release"
+  },
+  "query": "needle",
+  "results": {
+    "1000": {
+      "coldMs": 415.8594,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\1000",
+      "runs": 30,
+      "warmMaxMs": 434.6115,
+      "warmMinMs": 390.0949,
+      "warmP50Ms": 415.5359,
+      "warmP95Ms": 428.3969,
+      "warmup": 5,
+      "notes": 1000,
+      "bytes": 28573385
+    },
+    "10000": {
+      "coldMs": 4076.2856999999995,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\10000",
+      "runs": 20,
+      "warmMaxMs": 4119.4265000000005,
+      "warmMinMs": 3997.6279999999997,
+      "warmP50Ms": 4050.8094000000006,
+      "warmP95Ms": 4087.3673999999996,
+      "warmup": 5,
+      "notes": 10000,
+      "bytes": 225788729
+    },
+    "50000": {
+      "coldMs": 20193.3103,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\50000",
+      "runs": 10,
+      "warmMaxMs": 20526.7129,
+      "warmMinMs": 19620.7073,
+      "warmP50Ms": 20279.5468,
+      "warmP95Ms": 20526.7129,
+      "warmup": 3,
+      "notes": 50000,
+      "bytes": 1138251705
+    }
+  },
+  "methodology": {
+    "cold": "fresh process, corpus already read once so antivirus first-touch is excluded",
+    "percentile": "nearest-rank over warm runs",
+    "note": "baseline captured with MAX_NOTES raised to 50,000; no L0/L1/L2 optimization applied"
+  }
+}
