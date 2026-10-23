@@ -10,6 +10,8 @@ const MAX_NOTES: usize = 50_000;
 const MAX_DEPTH: usize = 12;
 const MAX_TITLE_CHARS: usize = 80;
 
+const MAX_WORKERS: usize = 8;
+
 const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", "build"];
 const MARKDOWN_EXTS: &[&str] = &["md", "markdown", "mdown"];
 
@@ -186,53 +188,110 @@ fn entry_for(root: &Path, path: &Path) -> Option<NoteEntry> {
     })
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<NoteEntry>) -> AppResult<()> {
-    if depth > MAX_DEPTH {
-        return Ok(());
-    }
+/// Depth-first enumeration of candidate note paths. Directory listing is cheap
+/// (one `read_dir` per folder) and stays serial; the per-note `metadata` call is
+/// what costs, so it moves to `resolve_entries` where it can run in parallel.
+fn collect_note_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut paths = Vec::new();
 
-    let entries = fs::read_dir(dir).map_err(|error| format!("cannot read folder: {error}"))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot read folder entry: {error}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot read file type: {error}"))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        // Symlinks are skipped: they can escape the workspace or create cycles.
-        if file_type.is_symlink() {
+    while let Some((dir, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
             continue;
         }
 
-        if file_type.is_dir() {
-            if name.starts_with('.') || IGNORED_DIRS.iter().any(|dir| name.eq_ignore_ascii_case(dir)) {
+        let entries = fs::read_dir(&dir).map_err(|error| format!("cannot read folder: {error}"))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read folder entry: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot read file type: {error}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            // Symlinks are skipped: they can escape the workspace or create cycles.
+            if file_type.is_symlink() {
                 continue;
             }
-            walk(root, &entry.path(), depth + 1, out)?;
-            continue;
-        }
 
-        if !file_type.is_file() || name.starts_with('.') {
-            continue;
-        }
+            if file_type.is_dir() {
+                if name.starts_with('.')
+                    || IGNORED_DIRS
+                        .iter()
+                        .any(|ignored| name.eq_ignore_ascii_case(ignored))
+                {
+                    continue;
+                }
+                pending.push((entry.path(), depth + 1));
+                continue;
+            }
 
-        let path = entry.path();
-        if !is_markdown(&path) {
-            continue;
-        }
+            if !file_type.is_file() || name.starts_with('.') {
+                continue;
+            }
 
-        if out.len() >= MAX_NOTES {
-            return Err(format!("workspace contains more than {MAX_NOTES} notes"));
-        }
+            let path = entry.path();
+            if !is_markdown(&path) {
+                continue;
+            }
 
-        if let Some(note) = entry_for(root, &path) {
-            out.push(note);
+            if paths.len() >= MAX_NOTES {
+                return Err(format!("workspace contains more than {MAX_NOTES} notes"));
+            }
+
+            paths.push(path);
         }
     }
 
-    Ok(())
+    Ok(paths)
+}
+
+/// Turns candidate paths into entries. Notes whose metadata cannot be read are
+/// skipped, and the work is split across threads because a stat per note is the
+/// dominant syscall cost on large workspaces.
+fn resolve_entries(root: &Path, paths: &[PathBuf]) -> Vec<NoteEntry> {
+    if paths.len() < 2 {
+        return paths
+            .iter()
+            .filter_map(|path| entry_for(root, path))
+            .collect();
+    }
+
+    let workers = worker_count(MAX_WORKERS).min(paths.len());
+    let chunk_size = paths.len().div_ceil(workers);
+    let mut notes = Vec::with_capacity(paths.len());
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = paths
+            .chunks(chunk_size)
+            .map(|slice| {
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .filter_map(|path| entry_for(root, path))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            if let Ok(mut chunk) = handle.join() {
+                notes.append(&mut chunk);
+            }
+        }
+    });
+
+    notes
+}
+
+/// Shared thread-count rule for scan work: enough to hide stat/read latency,
+/// capped so extra threads do not just contend for one disk.
+pub(crate) fn worker_count(max: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(max)
 }
 
 fn strip_markdown_extension(input: &str) -> &str {
@@ -295,8 +354,8 @@ fn sanitize_title(input: &str) -> String {
 #[tauri::command]
 pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
     let root = canonical_root(&root)?;
-    let mut notes = Vec::new();
-    walk(&root, &root, 0, &mut notes)?;
+    let paths = collect_note_paths(&root)?;
+    let mut notes = resolve_entries(&root, &paths);
     // Precompute the lowercase key once per note instead of allocating twice
     // on every comparison.
     notes.sort_by_cached_key(|note| (note.path.to_ascii_lowercase(), note.path.clone()));

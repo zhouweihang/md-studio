@@ -94,7 +94,7 @@ flowchart TB
 | 组件 | 职责 | 文件 |
 |---|---|---|
 | 命令层 | `list_notes` / `read_note` / `write_note` / `create_note` / `delete_note` / `restore_note` / `rename_note` / `search_notes` 注册 | `src-tauri/src/lib.rs` |
-| 文件域 | 根规范化、相对路径校验、递归扫描、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
+| 文件域 | 根规范化、相对路径校验、递归扫描（串行枚举 + 并行 stat，≤8 线程）、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
 | 搜索引擎（计划） | 内存快照、LRU 预算、并行匹配、片段生成、请求取消 | `src-tauri/src/search.rs` |
 | 文件监听（计划） | notify 递归监听、300 ms 去抖、增量更新快照与降级状态 | `src-tauri/src/watcher.rs` |
 
@@ -212,3 +212,5 @@ RFC-006 计划（未实现）：
 - 2026-10-23 RFC-005：内容命中片段高亮查询词；新增 1,000 篇笔记的 Rust 搜索耗时回归测试。
 - 2026-10-23 RFC-005 验证：前端 36 passed、Rust 22 passed、1,001 篇搜索实测 330.97ms、typecheck/build/NSIS 1.52 MiB/docs PASS。
 - 2026-10-23 RFC-006：搜索计划改为「内存快照 + 并行 + Channel 流式」，新增 `search.rs` / `watcher.rs` 规划，`MAX_NOTES` 目标 50k 并配套侧栏虚拟化；当前代码尚未实现。
+- 2026-10-24 RFC-006 L0/L1：`search.rs` 承载匹配与片段生成（L0）并按块并行扫描（L1，`std::thread::scope`、≤8 线程）；`notes.rs` 的扫描拆为串行枚举 + 并行 stat。分层与命令契约未变。
+- 2026-10-24 RFC-006 L0/L1 验证：Rust 27 passed、`check:perf` PASS（1k 415.5→83.7 ms）；内存快照、流式与监听仍未实现。

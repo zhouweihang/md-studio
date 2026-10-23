@@ -1,14 +1,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use aho_corasick::AhoCorasick;
 use serde::Serialize;
 
-use crate::notes::{canonical_root, ensure_within, list_notes, relative_note_path};
+use crate::notes::{
+    NoteEntry, canonical_root, ensure_within, list_notes, relative_note_path, worker_count,
+};
 
 pub const MAX_SEARCH_HITS: usize = 50;
 pub const MAX_HITS_PER_NOTE: usize = 3;
 pub const PREVIEW_CHARS: usize = 90;
+/// Upper bound on scan workers. Past this point the scan is bound by disk and
+/// antivirus inspection rather than by cores, so extra threads stop paying off.
+pub const MAX_SEARCH_THREADS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +30,8 @@ pub struct SearchHit {
 /// Scans every Markdown note under `root` and returns up to
 /// `MAX_SEARCH_HITS` line hits. RFC-006 L0: the ASCII path matches through a
 /// case-insensitive automaton, so unmatched lines are never lowercased.
+/// RFC-006 L1: the path-sorted note list is split into contiguous ranges that
+/// are scanned in parallel.
 pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, String> {
     let needle = query.trim();
     if needle.is_empty() {
@@ -33,14 +41,65 @@ pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, 
     let matcher = Matcher::new(needle);
     let root_path = canonical_root(root)?;
     let notes = list_notes(root.to_string())?;
+
+    if notes.len() < 2 {
+        return Ok(scan_notes(&matcher, &root_path, &notes, MAX_SEARCH_HITS));
+    }
+
+    let workers = search_workers().min(notes.len());
+    let chunk_size = notes.len().div_ceil(workers);
+    let mut chunk_hits: Vec<Vec<SearchHit>> = Vec::with_capacity(workers);
+    let mut panicked = false;
+
+    // Chunks are contiguous slices of the same path-sorted list and joins run in
+    // chunk order, so concatenating them reproduces the serial hit order and the
+    // global cap only ever drops the tail. Each chunk keeps at most the global
+    // cap of its own hits, which is all a truncated prefix can consume.
+    thread::scope(|scope| {
+        let matcher = &matcher;
+        let root_path = &root_path;
+        let handles: Vec<_> = notes
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || scan_notes(matcher, root_path, chunk, MAX_SEARCH_HITS))
+            })
+            .collect();
+
+        for handle in handles {
+            match handle.join() {
+                Ok(hits) => chunk_hits.push(hits),
+                Err(_) => panicked = true,
+            }
+        }
+    });
+
+    if panicked {
+        return Err("search worker thread panicked".to_string());
+    }
+
+    let mut hits = Vec::with_capacity(MAX_SEARCH_HITS);
+    for chunk in chunk_hits {
+        let remaining = MAX_SEARCH_HITS.saturating_sub(hits.len());
+        if remaining == 0 {
+            break;
+        }
+        hits.extend(chunk.into_iter().take(remaining));
+    }
+
+    Ok(hits)
+}
+
+/// One contiguous range of the path-sorted note list. Stops at `limit` hits or
+/// when the range is exhausted, exactly like a serial scan would.
+fn scan_notes(matcher: &Matcher, root: &Path, notes: &[NoteEntry], limit: usize) -> Vec<SearchHit> {
     let mut hits = Vec::new();
 
     for note in notes {
-        if hits.len() >= MAX_SEARCH_HITS {
+        if hits.len() >= limit {
             break;
         }
 
-        let target = match resolve_search_target(&root_path, &note.path) {
+        let target = match resolve_search_target(root, &note.path) {
             Ok(path) => path,
             Err(_) => continue,
         };
@@ -51,7 +110,7 @@ pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, 
 
         let mut note_hits = 0;
         for (index, line) in text.lines().enumerate() {
-            if note_hits >= MAX_HITS_PER_NOTE || hits.len() >= MAX_SEARCH_HITS {
+            if note_hits >= MAX_HITS_PER_NOTE || hits.len() >= limit {
                 break;
             }
             let trimmed = line.trim();
@@ -67,7 +126,11 @@ pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, 
         }
     }
 
-    Ok(hits)
+    hits
+}
+
+fn search_workers() -> usize {
+    worker_count(MAX_SEARCH_THREADS)
 }
 
 /// Paths produced by `walk` are already relative, normalized, and symlink-free.
@@ -263,6 +326,58 @@ mod tests {
 
         let non_markdown = resolve_search_target(root, "ok.txt").unwrap_err();
         assert!(non_markdown.contains("Markdown"), "{non_markdown}");
+    }
+
+    #[test]
+    fn parallel_scan_matches_serial_scan_hit_for_hit() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        // 60 notes x 5 matching lines is well past the global cap of 50, so the
+        // comparison also proves truncation only ever drops the tail.
+        for index in 0..60 {
+            let mut body = format!("# Note {index}\n\n");
+            for line in 0..5 {
+                body.push_str(&format!("needle on line {line}\n"));
+            }
+            if index % 13 == 0 {
+                body.push_str("the rare token lives here\n");
+            }
+            write_file(
+                root,
+                &format!("folder-{}/note-{index:04}.md", index % 4),
+                &body,
+            );
+        }
+
+        let root_string = root.to_string_lossy().into_owned();
+        let root_path = canonical_root(&root_string).unwrap();
+        let notes = list_notes(root_string.clone()).unwrap();
+
+        for query in ["needle", "rare token"] {
+            let matcher = Matcher::new(query);
+            let serial = scan_notes(&matcher, &root_path, &notes, MAX_SEARCH_HITS);
+            let parallel = search_notes_blocking(&root_string, query).unwrap();
+
+            assert_eq!(parallel, serial, "query {query:?} diverged from serial scan");
+        }
+
+        let hits = search_notes_blocking(&root_string, "needle").unwrap();
+        assert_eq!(hits.len(), MAX_SEARCH_HITS);
+
+        let mut per_note: std::collections::BTreeMap<&str, usize> = Default::default();
+        for hit in &hits {
+            *per_note.entry(hit.path.as_str()).or_default() += 1;
+        }
+        assert!(
+            per_note.values().all(|count| *count <= MAX_HITS_PER_NOTE),
+            "per-note cap regressed: {per_note:?}"
+        );
+
+        let paths: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "hit order should follow the path-sorted scan order");
     }
 
     #[test]

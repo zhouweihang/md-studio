@@ -1,6 +1,6 @@
 # RFC-006: 搜索性能重构（内存快照、流式契约与 50k 规模）（域 Search）
 
-> Status: Draft | Type: RFC | Created: 2026-10-23 | Updated: 2026-10-23 | Authors: Buffy | Reviewers: 项目所有者 | Target: v0.6.0
+> Status: Draft | Type: RFC | Created: 2026-10-23 | Updated: 2026-10-24 | Authors: Buffy | Reviewers: 项目所有者 | Target: v0.6.0
 > 索引：`RFC-006` | 关联 REQ：REQ-022~REQ-030 | 收益：10k 工作区暖查询 p95 ≤20 ms，50k 可打开可搜索，搜索延迟从「随文件数线性劣化」变成可验收的指标
 > 位置：本文档为权威方案；需求与决策快照见 `docs/specs/2026-10-23-search-performance-design.md`
 
@@ -9,6 +9,8 @@
 ## 0. 更新摘要
 
 2026-10-23：建立 RFC-006。RFC-005 只给搜索加了一条 1,001 篇的 10 s 回归护栏；实测 1,001 篇 release 313 ms，且 debug 与 release 只差 6%，说明瓶颈是每次查询重扫磁盘而非计算。本 RFC 把搜索重构为「打开工作区后台预热的内存快照 + 并行扫描 + Channel 流式返回」，并把 `MAX_NOTES` 提升到 50,000 配套侧栏虚拟化。
+
+2026-10-24：L0、L1 已实现并上线（REQ-022 / REQ-023）。暖 p50 从基线 415.5 / 4,050.8 / 20,279.5 ms 降到 83.7 / 793.8 / 4,322.1 ms（1k / 10k / 50k）；命中语义与顺序不变，跨块顺序由块序拼接 + 主线程截断保证。内存快照、流式契约与监听仍待 Task 4–6。
 
 ## 1. 需求
 
@@ -91,6 +93,8 @@ src-tauri/src/bin/bench_search.rs  独立基准入口（release）
 - 按笔记切块，`rayon` 或 `std::thread::scope` 并行；线程数 `min(available_parallelism, 8)`。
 - 全局命中上限用原子计数或「线程局部收集 + 主线程截断」，两种实现都必须保证不超过 50 条。
 - 顺序：L1 单独上线时按路径排序后返回，保持与现状一致；接入流式后由 §4.5 的批次语义接管。
+
+实现（2026-10-24）：选用 `std::thread::scope`，切分静态、按块序合并，无需额外依赖。① 路径切块扫描：每块局部封顶 50 条，主线程按块序拼接并截断，因此顺序与串行完全一致；② 枚举并行：`walk` 拆为串行 `collect_note_paths`（目录列表便宜）与并行 `resolve_entries`（每篇一次 `stat`，是真正的瓶颈）。只做 ① 时 1k 136 ms，枚举占 77 ms；两段并行后 1k 83.7 ms。
 
 ### 4.4 L2 内存快照（REQ-024 / REQ-025）
 
@@ -202,7 +206,7 @@ pub fn search_cancel(request_id: u64);
 | REQ | 验收方式 | 当前状态 |
 |---|---|---|
 | REQ-022 | 1k 基准 ≥10% 提升；匹配语义用例全绿 | **通过 2026-10-23**：暖 p50 1k −30.1%、10k −28.9%、50k −26.6%；`aho-corasick` ASCII 匹配、按需片段、排序 key 预计算、搜索路径去 canonicalize；Rust 26 passed |
-| REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | 待实现（plan Task 3） |
+| REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | **通过 2026-10-24**：1k 暖 p50 83.7 ms / p95 93.3 ms，10k 793.8 ms，50k 4,322.1 ms（L0 为 290.3 / 2,880.8 / 14,881.8）；跨块顺序由块序拼接 + 主线程截断保证，`parallel_scan_matches_serial_scan_hit_for_hit` 逐条比对；Rust 27 passed |
 | REQ-024 | 10k 暖查询 p95 ≤20 ms；LRU 单测 | 待实现（plan Task 4） |
 | REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | 待实现（plan Task 4） |
 | REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | 待实现（plan Task 5） |

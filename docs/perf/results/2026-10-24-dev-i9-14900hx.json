@@ -1,0 +1,67 @@
+{
+  "tier": "dev-i9-14900hx",
+  "capturedAt": "2026-10-23",
+  "machine": {
+    "cpu": "Intel(R) Core(TM) i9-14900HX",
+    "cores": 32,
+    "ramGb": 47.7,
+    "os": "win32 10.0.26300"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "profile": "release"
+  },
+  "query": "needle",
+  "results": {
+    "1000": {
+      "coldMs": 83.2961,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\1000",
+      "runs": 30,
+      "warmMaxMs": 94.72540000000001,
+      "warmMinMs": 80.9911,
+      "warmP50Ms": 83.6644,
+      "warmP95Ms": 93.3252,
+      "warmup": 5,
+      "notes": 1000,
+      "bytes": 28573385
+    },
+    "10000": {
+      "coldMs": 800.8779000000001,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\10000",
+      "runs": 20,
+      "warmMaxMs": 821.1551999999999,
+      "warmMinMs": 775.7728999999999,
+      "warmP50Ms": 793.8495,
+      "warmP95Ms": 815.8483,
+      "warmup": 5,
+      "notes": 10000,
+      "bytes": 225788729
+    },
+    "50000": {
+      "coldMs": 4028.9845,
+      "hits": 1,
+      "peakRssMb": null,
+      "query": "needle",
+      "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\50000",
+      "runs": 10,
+      "warmMaxMs": 4418.062,
+      "warmMinMs": 4191.0243,
+      "warmP50Ms": 4322.0672,
+      "warmP95Ms": 4418.062,
+      "warmup": 5,
+      "notes": 50000,
+      "bytes": 1138251705
+    }
+  },
+  "methodology": {
+    "cold": "fresh process; antivirus first-touch inflates the first read on this corpus, so cold is informational and not gated",
+    "percentile": "nearest-rank over warm runs",
+    "note": "RFC-006 L1 applied (parallel chunked scan + parallel workspace stat); baseline is pre-L0. Sidebar virtualization and the memory snapshot are not part of this measurement."
+  }
+}

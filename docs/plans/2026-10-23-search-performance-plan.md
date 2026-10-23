@@ -6,7 +6,7 @@
 
 **Goal:** 把搜索从「每次查询重扫磁盘」重构为「后台预热的内存快照 + 并行扫描 + Channel 流式返回」，10k 档暖查询 p95 ≤20 ms，50k 档可打开可搜索，并建立分机器基线的回归门禁。
 
-**Status:** Pending（文档已完成，代码未开始）。
+**Status:** In progress（Task 0–2 完成并已上线；下一步 Task 3）。
 
 **权威文档：** `docs/rfc/RFC-006-search-performance.md`、`docs/specs/2026-10-23-search-performance-design.md`、ADR-007~009。
 
@@ -70,14 +70,16 @@
 
 ## Task 3: L1 并行扫描（REQ-023）
 
-**Files:** `src-tauri/src/search.rs`
+**Files:** `src-tauri/src/search.rs`、`src-tauri/src/notes.rs`（枚举阶段并行 stat）
 
-- [ ] **Step 1**: 笔记切块并行扫描，线程数 `min(available_parallelism, 8)`。
-- [ ] **Step 2**: 全局命中上限用原子计数或局部收集 + 主线程截断，保证 ≤50 条。
-- [ ] **Step 3**: 与串行结果做逐条比对测试（路径、行号、片段）。
-- [ ] **Step 4**: 基准 1k 档 ≤120 ms。
+- [x] **Step 1**: 笔记切块并行扫描，线程数 `min(available_parallelism, 8)`；用 `std::thread::scope` 而非 `rayon`（切分是静态的、按顺序合并，`rayon` 只会多一个依赖）。
+- [x] **Step 2**: 每块局部收集并各自封顶 50 条，按块序拼接后由主线程截断，保证 ≤50 条且顺序与串行一致。
+- [x] **Step 3**: `parallel_scan_matches_serial_scan_hit_for_hit` 用同一份 `NoteEntry` 列表比串行/并行结果（路径、行号、片段、顺序），并覆盖全局 50 条上限与每篇 3 条上限。
+- [x] **Step 4**: 基准 1k 档暖 p50 **83.7 ms** / p95 93.3 ms（目标 ≤120 ms）；10k 793.8 ms、50k 4,322.1 ms。
 
-**验收**：结果集完全一致；Windows Defender 开启状态下实测达标。
+**验收**：结果集与串行逐条一致（27 个 Rust 用例全绿）；Windows Defender 开启状态下 1k 档实测 83.7 ms，达标。
+
+**实现备注**：并行化分两段——① `search.rs` 按 `list_notes` 已排序的路径切块扫描；② `notes.rs` 把 `walk` 拆成「串行枚举路径 + 并行 stat」（`collect_note_paths` + `resolve_entries`）。只做 ① 时 1k 为 136 ms，枚举占其中 77 ms，是把枚举也并行后才进 120 ms 以内（25 ms）。两段共用 `worker_count`，上限都是 8。
 
 ## Task 4: L2 内存快照与预热（REQ-024 / REQ-025）
 
