@@ -1,6 +1,6 @@
 # ADR-003: 本地文件系统是唯一事实源
 
-> Status: Accepted | Date: 2026-10-23 | Deciders: 项目所有者 | 关联 RFC: RFC-001 §3、§4.1 | 影响：数据模型、启动流程、外部编辑兼容性
+> Status: Accepted（Amended by ADR-007） | Date: 2026-10-23 | Deciders: 项目所有者 | 关联 RFC: RFC-001 §3、§4.1、RFC-006 §4.4 | 影响：数据模型、启动流程、外部编辑兼容性
 
 ## Context
 
@@ -35,3 +35,7 @@
 - RFC-001 §3、§4.1、§7
 - ADR-001（Tauri 外壳）、ADR-002（端口/适配器）
 - `md-studio/src-tauri/src/notes.rs`（实现落点，待创建）
+
+## Amendment
+
+- 2026-10-23（ADR-007）：Decision 1 的「不缓存正文」限定为「不建持久化正文库」。进程内只读快照属于缓存而非事实源：写入前仍读盘比对 revision（ADR-005），监听失败时以 mtime+size 校验，切换工作区或退出即丢弃。事实源仍是磁盘，架构定位不变。

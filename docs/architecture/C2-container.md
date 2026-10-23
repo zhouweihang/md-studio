@@ -16,6 +16,7 @@ flowchart LR
   Browser[系统默认浏览器]
 
   WebView -->|invoke: list/read/write/create| Core
+  Core -->|Channel: search batch/done| WebView
   WebView -->|读写工作区路径| LS
   WebView -->|open directory| Dialog
   WebView -->|openUrl| Browser
@@ -32,10 +33,13 @@ flowchart LR
 | localStorage | WebView 内置 | 仅保存上次工作区根路径，不保存正文 |
 | 系统对话框 | `tauri-plugin-dialog` | 选择工作区目录 |
 | 系统浏览器 | `tauri-plugin-opener` | 打开预览中的外链 |
+| 搜索快照（计划） | Rust 进程内缓存 | 预热、LRU、并行匹配；默认 256 MB；失败回退实时扫描（ADR-007） |
+| 文件监听（计划） | `notify` | 递归监听工作区，300 ms 去抖后增量更新快照（ADR-009） |
 
 ## 3. 进程与通信
 
 - 单进程、双线程模型由 Tauri 管理；前端与 Rust 通过 JSON 序列化的 `invoke` 通信。
+- RFC-006 计划：搜索在 `invoke` 之上叠加 `tauri::ipc::Channel` 流式事件；Rust 侧新增快照缓存与监听线程，均不改变进程边界。
 - 命令契约（相对路径 + 工作区根）见 RFC-001 §4.1；错误统一为字符串，前端映射为状态栏提示。
 - 不启动本地 HTTP 服务；生产构建的前端资源由 Tauri 内置协议加载。
 
@@ -48,3 +52,4 @@ flowchart LR
 ## 5. 变更日志
 
 - 2026-10-23 建立 C2；确定「WebView 不直接持有 fs 权限」的容器边界。
+- 2026-10-23 RFC-006：规划 Channel 流式搜索、内存快照与 notify 监听；容器数量与权限模型不变。

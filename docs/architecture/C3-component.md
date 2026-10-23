@@ -1,6 +1,6 @@
 # C3: Component 视图
 
-> C4 Level 3 | 对应 RFC-001 | Updated: 2026-10-23 | 状态：首版，反映 MVP 的域分解与数据流
+> C4 Level 3 | 对应 RFC-001、RFC-006 | Updated: 2026-10-23 | 状态：反映 MVP 的域分解；RFC-006 的搜索快照、流式与监听标注为计划态
 
 ## 1. 总览图
 
@@ -95,6 +95,8 @@ flowchart TB
 |---|---|---|
 | 命令层 | `list_notes` / `read_note` / `write_note` / `create_note` / `delete_note` / `restore_note` / `rename_note` / `search_notes` 注册 | `src-tauri/src/lib.rs` |
 | 文件域 | 根规范化、相对路径校验、递归扫描、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
+| 搜索引擎（计划） | 内存快照、LRU 预算、并行匹配、片段生成、请求取消 | `src-tauri/src/search.rs` |
+| 文件监听（计划） | notify 递归监听、300 ms 去抖、增量更新快照与降级状态 | `src-tauri/src/watcher.rs` |
 
 ## 3. 数据流
 
@@ -125,9 +127,19 @@ flowchart TB
 
 ### 3.5 全文搜索
 
+现状（v0.1.0）：
+
 1. 查询变化 → 250ms 防抖 → `WorkspaceService.search` → `invoke('search_notes')`。
 2. Rust 复用 `list_notes` 扫描结果，逐篇读取正文、逐行匹配，返回 `SearchHit[]`。
 3. `Sidebar` 同时渲染文件名树与内容命中；`highlightParts(preview, query)` 把命中词切分为 `<mark>`；点击命中调用 `openNote(note, line)`，`EditorPane` 定位到行。
+
+RFC-006 计划（未实现）：
+
+1. 打开工作区 → 后台预热内存快照（`search.rs`），状态 `Warming → Ready`。
+2. 查询 → 自适应防抖 80/120/200 ms → `search_notes(root, query, request_id, channel)`。
+3. Rust 在快照上并行扫描，每批 ≤16 条经 Channel 发送，最后发唯一 `Done`。
+4. `Sidebar` 每批追加并按路径稳定排序；`Done` 显示总数、耗时与数据来源。
+5. 监听（`watcher.rs`）增量更新快照；失败置 `Degraded`，查询前 mtime+size 校验。
 
 ### 3.6 关闭前 flush
 
@@ -148,6 +160,14 @@ flowchart TB
 2. 点「撤销」→ `invoke('restore_note', { path, content })`；Rust 拒绝已存在的目标路径并重新校验工作区边界。
 3. 成功后刷新列表并 `openNote(restored)` 重新读取 revision；toast 关闭。
 4. 8 秒无操作后 toast 自动消失，撤销入口结束；更早的文件由系统回收站找回。
+
+### 3.9 搜索快照与失效（RFC-006，计划）
+
+1. 打开工作区：`snapshot_status` 进入 `Warming`，64 篇一批读入，不阻塞编辑。
+2. 查询：快照命中走内存并行扫描；未就绪、被淘汰、超限或非 UTF-8 回退读盘。
+3. 失效：notify 事件 300 ms 去抖后增量更新；监听失败置 `Degraded`；手动刷新全量对账。
+4. 取消：`request_id` 单调递增，工作线程每批检查，前端丢弃迟到批次。
+5. 边界：快照只读；保存仍读盘比对 revision（ADR-005），删除/恢复/重命名语义不变。
 
 ## 4. 部署与运行时
 
@@ -174,6 +194,10 @@ flowchart TB
 | RFC-004 REQ-018；ADR-006 | `handleUndoDelete`、UndoToast、`NoteDialog` | `src/ui/App.test.tsx` |
 | RFC-005 REQ-020；ADR-004 | `highlightParts`、`hit-mark`、`Sidebar` | `src/core/search.test.ts`、`src/ui/App.test.tsx` |
 | RFC-005 REQ-021；ADR-004 | `search_notes_blocking` 大工作区耗时 | Rust 单测 |
+| RFC-006 REQ-022~025；ADR-007 | SearchSnapshot、LRU、预热状态机 | 计划：`search.rs` 单测 + `bench_search` |
+| RFC-006 REQ-026；ADR-008 | Channel 流式契约、请求取消 | 计划：契约测试 + `App.test.tsx` |
+| RFC-006 REQ-027；ADR-009 | Watcher、mtime 兜底、手动对账 | 计划：临时目录集成测试 |
+| RFC-006 REQ-028~030 | 50k 上限、侧栏虚拟化、基准门禁 | 计划：50k 基准 + UI 测试 |
 
 ## 6. 变更日志
 
@@ -187,3 +211,4 @@ flowchart TB
 - 2026-10-23 RFC-004 验证：前端 30 passed、Rust 21 passed、typecheck/build/NSIS 1.52 MiB/docs PASS；系统回收站调用在单测中用闭包替换。
 - 2026-10-23 RFC-005：内容命中片段高亮查询词；新增 1,000 篇笔记的 Rust 搜索耗时回归测试。
 - 2026-10-23 RFC-005 验证：前端 36 passed、Rust 22 passed、1,001 篇搜索实测 330.97ms、typecheck/build/NSIS 1.52 MiB/docs PASS。
+- 2026-10-23 RFC-006：搜索计划改为「内存快照 + 并行 + Channel 流式」，新增 `search.rs` / `watcher.rs` 规划，`MAX_NOTES` 目标 50k 并配套侧栏虚拟化；当前代码尚未实现。

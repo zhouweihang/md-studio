@@ -68,8 +68,8 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 
 更多设计：
 
-- 权威设计：[`docs/rfc/RFC-001-md-studio-mvp.md`](docs/rfc/RFC-001-md-studio-mvp.md)、[`RFC-002`](docs/rfc/RFC-002-note-management-and-search.md)、[`RFC-003`](docs/rfc/RFC-003-close-flush-and-conflicts.md)、[`RFC-004`](docs/rfc/RFC-004-trash-and-undo.md)、[`RFC-005`](docs/rfc/RFC-005-search-highlight-and-perf.md)
-- 搜索决策：[`ADR-004`](docs/adr/004-rust-scan-search.md)
+- 权威设计：[`docs/rfc/RFC-001-md-studio-mvp.md`](docs/rfc/RFC-001-md-studio-mvp.md)、[`RFC-002`](docs/rfc/RFC-002-note-management-and-search.md)、[`RFC-003`](docs/rfc/RFC-003-close-flush-and-conflicts.md)、[`RFC-004`](docs/rfc/RFC-004-trash-and-undo.md)、[`RFC-005`](docs/rfc/RFC-005-search-highlight-and-perf.md)、[`RFC-006`](docs/rfc/RFC-006-search-performance.md)
+- 搜索决策：[`ADR-004`](docs/adr/004-rust-scan-search.md)（Superseded by [`ADR-007`](docs/adr/007-search-snapshot-cache.md)）、[`ADR-008`](docs/adr/008-streaming-search-channel.md)、[`ADR-009`](docs/adr/009-workspace-watcher.md)
 - 并发决策：[`ADR-005`](docs/adr/005-content-revision-concurrency.md)
 - 删除决策：[`ADR-006`](docs/adr/006-system-trash-and-snapshot-undo.md)
 - 决策记录：[`docs/adr/README.md`](docs/adr/README.md)
@@ -82,7 +82,7 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 
 - WebView 不启用 `fs` 插件，不持有任意路径读写能力。
 - 所有路径在 Rust 侧校验：只允许工作区内的相对 Markdown 路径；符号链接目录被跳过。
-- 单文件上限 5 MiB；工作区最多扫描 10,000 篇，目录深度上限 12。
+- 单文件上限 5 MiB；工作区最多扫描 10,000 篇（RFC-006 计划提升到 50,000），目录深度上限 12。
 - 预览 HTML 先经 DOMPurify 清理；外链由系统浏览器打开，不在 WebView 内导航。
 
 ## 已知限制
@@ -92,7 +92,7 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 - 冲突检查与写入之间仍有极小的 TOCTOU 窗口，不引入跨平台文件锁（ADR-005）。
 - 撤销只覆盖最近一次删除且仅在当前会话；超过 5 MiB 或非 UTF-8 的文件仍可删除，但没有应用内撤销。
 - 恢复只写回内容与路径，不保留文件元数据；更早的删除请到系统回收站找回。
-- 搜索性能基线：1,001 篇笔记约 0.33s（debug 测试）；更大工作区仍按 ADR-004 评估是否引入索引。
+- 搜索性能基线：1,001 篇笔记 release 约 0.31s（debug 0.33s）；10k/50k 的重构（内存快照 + 并行 + 流式）见 RFC-006 与 ADR-007~009，尚未实现。
 - 当前只验证 Windows；CI 跨平台矩阵尚未建立。
 
 完整清单与收尾标准见 [`docs/backlog.md`](docs/backlog.md)。
