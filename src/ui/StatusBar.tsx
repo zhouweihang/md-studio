@@ -1,6 +1,6 @@
 import { countLines, countWords } from '../core/notes'
 
-export type SaveState = 'idle' | 'pending' | 'saved' | 'error'
+export type SaveState = 'idle' | 'pending' | 'saved' | 'error' | 'conflict'
 
 interface StatusBarProps {
   path: string
@@ -14,10 +14,12 @@ const labels: Record<SaveState, string> = {
   pending: '未保存',
   saved: '已保存',
   error: '保存失败',
+  conflict: '磁盘已变更',
 }
 
 export function StatusBar({ path, content, dirty, state }: StatusBarProps) {
-  const visualState: SaveState = state === 'error' ? 'error' : dirty ? 'pending' : state
+  const visualState: SaveState =
+    state === 'conflict' || state === 'error' ? state : dirty ? 'pending' : state
 
   return (
     <footer className="status-bar">

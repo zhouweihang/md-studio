@@ -9,7 +9,11 @@ pub fn run() {
             notes::list_notes,
             notes::read_note,
             notes::write_note,
-            notes::create_note
+            notes::create_note,
+            notes::delete_note,
+            notes::restore_note,
+            notes::rename_note,
+            notes::search_notes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

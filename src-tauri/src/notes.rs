@@ -7,6 +7,9 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_NOTES: usize = 10_000;
 const MAX_DEPTH: usize = 12;
 const MAX_TITLE_CHARS: usize = 80;
+const MAX_SEARCH_HITS: usize = 50;
+const MAX_HITS_PER_NOTE: usize = 3;
+const PREVIEW_CHARS: usize = 90;
 
 const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", "build"];
 const MARKDOWN_EXTS: &[&str] = &["md", "markdown", "mdown"];
@@ -23,11 +26,50 @@ pub struct NoteEntry {
     pub modified_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteDocument {
+    pub content: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedNote {
+    /// Relative path the note can be restored to.
+    pub path: String,
+    /// In-memory text snapshot for the undo entry. `None` when the file is
+    /// over the size limit or is not valid UTF-8.
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub path: String,
+    pub title: String,
+    /// One-based line number in the note.
+    pub line: u32,
+    /// Context around the match, truncated by characters.
+    pub preview: String,
+}
+
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| MARKDOWN_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// FNV-1a over the raw bytes. This is a change-detection token, not a
+/// cryptographic digest or a security boundary.
+fn revision_for_bytes(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn canonical_root(root: &str) -> AppResult<PathBuf> {
@@ -205,14 +247,20 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<NoteEntry>) -> AppR
     Ok(())
 }
 
+fn strip_markdown_extension(input: &str) -> &str {
+    let lower = input.to_ascii_lowercase();
+    for extension in MARKDOWN_EXTS {
+        let suffix = format!(".{extension}");
+        if lower.ends_with(&suffix) {
+            return &input[..input.len() - suffix.len()];
+        }
+    }
+    input
+}
+
 fn sanitize_title(input: &str) -> String {
     let trimmed = input.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let stem = if lower.ends_with(".md") {
-        &trimmed[..trimmed.len() - 3]
-    } else {
-        trimmed
-    };
+    let stem = strip_markdown_extension(trimmed);
 
     let mut output = String::new();
     for character in stem.chars() {
@@ -271,7 +319,7 @@ pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
 }
 
 #[tauri::command]
-pub fn read_note(root: String, path: String) -> AppResult<String> {
+pub fn read_note(root: String, path: String) -> AppResult<NoteDocument> {
     let root = canonical_root(&root)?;
     let target = resolve_existing(&root, &path)?;
     let size = fs::metadata(&target)
@@ -285,12 +333,24 @@ pub fn read_note(root: String, path: String) -> AppResult<String> {
         ));
     }
 
-    fs::read_to_string(&target)
-        .map_err(|error| format!("note is not valid UTF-8 or cannot be read: {error}"))
+    let bytes = fs::read(&target)
+        .map_err(|error| format!("note is not valid UTF-8 or cannot be read: {error}"))?;
+    let content = String::from_utf8(bytes.clone())
+        .map_err(|error| format!("note is not valid UTF-8 or cannot be read: {error}"))?;
+
+    Ok(NoteDocument {
+        content,
+        revision: revision_for_bytes(&bytes),
+    })
 }
 
 #[tauri::command]
-pub fn write_note(root: String, path: String, content: String) -> AppResult<()> {
+pub fn write_note(
+    root: String,
+    path: String,
+    content: String,
+    expected_revision: String,
+) -> AppResult<String> {
     if content.len() as u64 > MAX_FILE_BYTES {
         return Err(format!(
             "note is too large ({} bytes, limit {MAX_FILE_BYTES})",
@@ -301,7 +361,20 @@ pub fn write_note(root: String, path: String, content: String) -> AppResult<()> 
     let root = canonical_root(&root)?;
     let target = resolve_target(&root, &path)?;
 
-    fs::write(&target, content.as_bytes()).map_err(|error| format!("cannot write note: {error}"))
+    if !target.exists() {
+        return Err("conflict: note no longer exists".to_string());
+    }
+
+    let current = fs::read(&target)
+        .map_err(|error| format!("cannot read note before writing: {error}"))?;
+    let current_revision = revision_for_bytes(&current);
+    if current_revision != expected_revision {
+        return Err("conflict: note was modified outside MD Studio".to_string());
+    }
+
+    fs::write(&target, content.as_bytes()).map_err(|error| format!("cannot write note: {error}"))?;
+
+    Ok(revision_for_bytes(content.as_bytes()))
 }
 
 #[tauri::command]
@@ -327,9 +400,177 @@ pub fn create_note(root: String, title: String) -> AppResult<NoteEntry> {
     entry_for(&root, &target).ok_or_else(|| "cannot read the new note".to_string())
 }
 
+#[tauri::command]
+pub fn delete_note(root: String, path: String) -> AppResult<DeletedNote> {
+    delete_note_with(root, path, |target| {
+        trash::delete(target).map_err(|error| error.to_string())
+    })
+}
+
+/// Splits the delete flow from the platform trash call so tests can verify the
+/// snapshot and failure semantics without touching the real recycle bin.
+fn delete_note_with<F>(root: String, path: String, trash_fn: F) -> AppResult<DeletedNote>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let root = canonical_root(&root)?;
+    let target = resolve_existing(&root, &path)?;
+    let size = fs::metadata(&target)
+        .map_err(|error| format!("cannot read note metadata: {error}"))?
+        .len();
+
+    // Read before trashing so a read failure aborts without deleting anything.
+    let content = if size <= MAX_FILE_BYTES {
+        let bytes = fs::read(&target)
+            .map_err(|error| format!("cannot read note before deleting: {error}"))?;
+        String::from_utf8(bytes).ok()
+    } else {
+        None
+    };
+
+    trash_fn(&target).map_err(|error| format!("cannot move note to trash: {error}"))?;
+
+    Ok(DeletedNote {
+        path: to_relative(&root, &target),
+        content,
+    })
+}
+
+#[tauri::command]
+pub fn restore_note(root: String, path: String, content: String) -> AppResult<NoteEntry> {
+    if content.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "note is too large ({} bytes, limit {MAX_FILE_BYTES})",
+            content.len()
+        ));
+    }
+
+    let root = canonical_root(&root)?;
+    let target = resolve_target(&root, &path)?;
+
+    if target.exists() {
+        return Err("note path is already occupied".to_string());
+    }
+
+    fs::write(&target, content.as_bytes())
+        .map_err(|error| format!("cannot restore note: {error}"))?;
+
+    entry_for(&root, &target).ok_or_else(|| "cannot read the restored note".to_string())
+}
+
+#[tauri::command]
+pub fn rename_note(root: String, path: String, new_title: String) -> AppResult<NoteEntry> {
+    let root = canonical_root(&root)?;
+    let source = resolve_existing(&root, &path)?;
+    let relative = relative_note_path(&path)?;
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let extension = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| MARKDOWN_EXTS.contains(&ext.as_str()))
+        .unwrap_or_else(|| "md".to_string());
+    let stem = sanitize_title(&new_title);
+    let target_relative = parent.join(format!("{stem}.{extension}"));
+    let target_relative_string = to_relative(&root, &root.join(&target_relative));
+    relative_note_path(&target_relative_string)?;
+    let target = root.join(&target_relative);
+
+    if target.exists() {
+        let canonical_target = fs::canonicalize(&target)
+            .map_err(|error| format!("cannot inspect target note: {error}"))?;
+        if canonical_target == source {
+            return entry_for(&root, &source)
+                .ok_or_else(|| "cannot read the renamed note".to_string());
+        }
+        return Err("a note with that name already exists".to_string());
+    }
+
+    fs::rename(&source, &target).map_err(|error| format!("cannot rename note: {error}"))?;
+    entry_for(&root, &target).ok_or_else(|| "cannot read the renamed note".to_string())
+}
+
+#[tauri::command]
+pub async fn search_notes(root: String, query: String) -> AppResult<Vec<SearchHit>> {
+    tauri::async_runtime::spawn_blocking(move || search_notes_blocking(&root, &query))
+        .await
+        .map_err(|error| format!("search task failed: {error}"))?
+}
+
+fn search_notes_blocking(root: &str, query: &str) -> AppResult<Vec<SearchHit>> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let needle_lower = needle.to_lowercase();
+    let root_path = canonical_root(root)?;
+    let notes = list_notes(root.to_string())?;
+    let mut hits = Vec::new();
+
+    for note in notes {
+        if hits.len() >= MAX_SEARCH_HITS {
+            break;
+        }
+
+        let target = match resolve_existing(&root_path, &note.path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let text = match fs::read_to_string(&target) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+
+        let mut note_hits = 0;
+        for (index, line) in text.lines().enumerate() {
+            if note_hits >= MAX_HITS_PER_NOTE || hits.len() >= MAX_SEARCH_HITS {
+                break;
+            }
+            if line.to_lowercase().contains(&needle_lower) {
+                hits.push(SearchHit {
+                    path: note.path.clone(),
+                    title: note.title.clone(),
+                    line: (index + 1) as u32,
+                    preview: build_preview(line, &needle_lower),
+                });
+                note_hits += 1;
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+fn build_preview(line: &str, needle_lower: &str) -> String {
+    let trimmed = line.trim();
+    let lowered = trimmed.to_lowercase();
+    let byte_index = lowered.find(needle_lower).unwrap_or(0);
+    let chars: Vec<char> = trimmed.chars().collect();
+    let char_index = lowered[..byte_index].chars().count().min(chars.len());
+    let needle_len = needle_lower.chars().count();
+    let start = char_index
+        .saturating_sub(PREVIEW_CHARS / 3)
+        .min(chars.len());
+    let end = (char_index + needle_len + PREVIEW_CHARS)
+        .max(start)
+        .min(chars.len());
+    let mut preview: String = chars[start..end].iter().collect();
+
+    if start > 0 {
+        preview.insert(0, '…');
+    }
+    if end < chars.len() {
+        preview.push('…');
+    }
+
+    preview
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn write_file(root: &Path, relative: &str, content: &str) {
@@ -363,21 +604,79 @@ mod tests {
     fn read_and_write_roundtrip() {
         let temp = tempdir().unwrap();
         let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
         write_file(root, "note.md", "# old");
 
-        write_note(
-            root.to_string_lossy().into_owned(),
+        let original = read_note(root_string.clone(), "note.md".to_string()).unwrap();
+        assert_eq!(original.content, "# old");
+        assert_eq!(original.revision.len(), 16);
+
+        let new_revision = write_note(
+            root_string.clone(),
             "note.md".to_string(),
             "# new\n\n正文".to_string(),
+            original.revision,
         )
         .unwrap();
 
-        let content = read_note(
-            root.to_string_lossy().into_owned(),
-            "note.md".to_string(),
+        let document = read_note(root_string, "note.md".to_string()).unwrap();
+        assert_eq!(document.content, "# new\n\n正文");
+        assert_eq!(document.revision, new_revision);
+    }
+
+    #[test]
+    fn revision_is_stable_and_changes_with_content() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "revision.md", "same");
+
+        let first = read_note(root_string.clone(), "revision.md".to_string()).unwrap();
+        let second = read_note(root_string.clone(), "revision.md".to_string()).unwrap();
+        assert_eq!(first.revision, second.revision);
+
+        write_file(root, "revision.md", "different");
+        let third = read_note(root_string, "revision.md".to_string()).unwrap();
+        assert_ne!(first.revision, third.revision);
+    }
+
+    #[test]
+    fn write_note_detects_conflict_after_external_modification() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "conflict.md", "disk one");
+
+        let document = read_note(root_string.clone(), "conflict.md".to_string()).unwrap();
+        write_file(root, "conflict.md", "external edit");
+
+        let error = write_note(
+            root_string,
+            "conflict.md".to_string(),
+            "local edit".to_string(),
+            document.revision,
         )
-        .unwrap();
-        assert_eq!(content, "# new\n\n正文");
+        .unwrap_err();
+
+        assert!(error.starts_with("conflict:"));
+        assert_eq!(
+            fs::read_to_string(root.join("conflict.md")).unwrap(),
+            "external edit"
+        );
+    }
+
+    #[test]
+    fn write_note_conflicts_when_note_is_missing() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_string_lossy().into_owned();
+        let error = write_note(
+            root,
+            "missing.md".to_string(),
+            "local".to_string(),
+            "0000000000000000".to_string(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("conflict:"));
     }
 
     #[test]
@@ -397,6 +696,7 @@ mod tests {
             root.to_string_lossy().into_owned(),
             "../evil.md".to_string(),
             "x".to_string(),
+            "0000000000000000".to_string(),
         )
         .unwrap_err();
         assert!(error.contains("escapes"));
@@ -447,7 +747,265 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = temp.path().to_string_lossy().into_owned();
         let oversized = "x".repeat(MAX_FILE_BYTES as usize + 1);
-        let error = write_note(root, "big.md".to_string(), oversized).unwrap_err();
+        let error = write_note(
+            root,
+            "big.md".to_string(),
+            oversized,
+            "0000000000000000".to_string(),
+        )
+        .unwrap_err();
         assert!(error.contains("too large"));
+    }
+
+    #[test]
+    fn delete_note_removes_file_and_rejects_traversal() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "delete-me.md", "gone");
+
+        delete_note_with(
+            root_string.clone(),
+            "delete-me.md".to_string(),
+            |target| fs::remove_file(target).map_err(|error| error.to_string()),
+        )
+        .unwrap();
+        assert!(!root.join("delete-me.md").exists());
+
+        let error = delete_note(root_string, "../outside.md".to_string()).unwrap_err();
+        assert!(error.contains("escapes"));
+    }
+
+    #[test]
+    fn delete_returns_snapshot_and_moves_note_out_of_the_workspace() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(root, "sub/gone.md", "# body");
+
+        let deleted = delete_note_with(
+            root.to_string_lossy().into_owned(),
+            "sub/gone.md".to_string(),
+            |target| fs::remove_file(target).map_err(|error| error.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(deleted.path, "sub/gone.md");
+        assert_eq!(deleted.content.as_deref(), Some("# body"));
+        assert!(!root.join("sub/gone.md").exists());
+    }
+
+    #[test]
+    fn delete_keeps_the_file_when_the_trash_call_fails() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(root, "keep.md", "precious");
+
+        let error = delete_note_with(
+            root.to_string_lossy().into_owned(),
+            "keep.md".to_string(),
+            |_| Err("recycle bin unavailable".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot move note to trash"));
+        assert_eq!(
+            fs::read_to_string(root.join("keep.md")).unwrap(),
+            "precious"
+        );
+    }
+
+    #[test]
+    fn delete_returns_no_snapshot_for_invalid_utf8() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("binary.md"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let deleted = delete_note_with(
+            root.to_string_lossy().into_owned(),
+            "binary.md".to_string(),
+            |target| fs::remove_file(target).map_err(|error| error.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(deleted.content, None);
+        assert!(!root.join("binary.md").exists());
+    }
+
+    #[test]
+    fn restore_note_writes_the_snapshot_back() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "undo.md", "# undo me\n\n正文");
+
+        let deleted = delete_note_with(
+            root_string.clone(),
+            "undo.md".to_string(),
+            |target| fs::remove_file(target).map_err(|error| error.to_string()),
+        )
+        .unwrap();
+
+        let restored = restore_note(
+            root_string.clone(),
+            deleted.path,
+            deleted.content.unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.path, "undo.md");
+        assert_eq!(
+            fs::read_to_string(root.join("undo.md")).unwrap(),
+            "# undo me\n\n正文"
+        );
+        let document = read_note(root_string, "undo.md".to_string()).unwrap();
+        assert_eq!(document.content, "# undo me\n\n正文");
+    }
+
+    #[test]
+    fn restore_note_refuses_to_overwrite_an_existing_file() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(root, "taken.md", "already here");
+
+        let error = restore_note(
+            root.to_string_lossy().into_owned(),
+            "taken.md".to_string(),
+            "restored".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("already occupied"));
+        assert_eq!(
+            fs::read_to_string(root.join("taken.md")).unwrap(),
+            "already here"
+        );
+    }
+
+    #[test]
+    fn restore_note_rejects_traversal_and_oversized_content() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_string_lossy().into_owned();
+
+        let error = restore_note(root.clone(), "../escape.md".to_string(), "x".to_string())
+            .unwrap_err();
+        assert!(error.contains("escapes"));
+
+        let oversized = "x".repeat(MAX_FILE_BYTES as usize + 1);
+        let error = restore_note(root, "big.md".to_string(), oversized).unwrap_err();
+        assert!(error.contains("too large"));
+    }
+
+    #[test]
+    fn rename_note_preserves_directory_and_extension() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "sub/old.markdown", "# body");
+
+        let renamed = rename_note(
+            root_string.clone(),
+            "sub/old.markdown".to_string(),
+            "New Name: v2".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(renamed.path, "sub/New-Name-v2.markdown");
+        assert_eq!(
+            fs::read_to_string(root.join("sub/New-Name-v2.markdown")).unwrap(),
+            "# body"
+        );
+        assert!(!root.join("sub/old.markdown").exists());
+
+        let same = rename_note(
+            root_string,
+            "sub/New-Name-v2.markdown".to_string(),
+            "New Name: v2".to_string(),
+        )
+        .unwrap();
+        assert_eq!(same.path, "sub/New-Name-v2.markdown");
+    }
+
+    #[test]
+    fn rename_note_rejects_existing_target() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let root_string = root.to_string_lossy().into_owned();
+        write_file(root, "a.md", "a");
+        write_file(root, "b.md", "b");
+
+        let error = rename_note(root_string, "a.md".to_string(), "b".to_string()).unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert!(root.join("a.md").exists());
+        assert_eq!(fs::read_to_string(root.join("b.md")).unwrap(), "b");
+    }
+
+    #[test]
+    fn create_note_strips_markdown_extension() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_string_lossy().into_owned();
+        let note = create_note(root, "readme.markdown".to_string()).unwrap();
+        assert_eq!(note.path, "readme.md");
+    }
+
+    #[test]
+    fn search_notes_finds_content_with_line_and_preview() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(
+            root,
+            "a.md",
+            "# Hello\n\nThe autosave loop is here.\nsecond AUTOSAVE",
+        );
+        write_file(root, "sub/b.md", "中文搜索关键字\n");
+        write_file(root, "name-only.md", "no matching body");
+        let root_string = root.to_string_lossy().into_owned();
+
+        let hits = search_notes_blocking(&root_string, "AUTOSAVE").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "a.md");
+        assert_eq!(hits[0].line, 3);
+        assert!(hits[0].preview.contains("autosave"));
+        assert_eq!(hits[1].line, 4);
+
+        let chinese = search_notes_blocking(&root_string, "关键字").unwrap();
+        assert_eq!(chinese.len(), 1);
+        assert_eq!(chinese[0].path, "sub/b.md");
+        assert_eq!(chinese[0].line, 1);
+
+        let filename_only = search_notes_blocking(&root_string, "name-only").unwrap();
+        assert!(filename_only.is_empty());
+
+        let blank = search_notes_blocking(&root_string, "   ").unwrap();
+        assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn search_notes_handles_a_large_workspace_within_budget() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let body = "line one\nline two\nline three\nline four\n".repeat(8);
+
+        for index in 0..1_000 {
+            write_file(
+                root,
+                &format!("bulk/note-{index:04}.md"),
+                &format!("# Note {index}\n\n{body}"),
+            );
+        }
+        write_file(root, "bulk/target.md", "# Target\n\nthe needle lives here\n");
+
+        let started = Instant::now();
+        let hits = search_notes_blocking(&root.to_string_lossy(), "needle").unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "bulk/target.md");
+        assert_eq!(hits[0].line, 3);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "large workspace search took {elapsed:?}, budget is 10s"
+        );
+        println!("large workspace search: 1001 notes in {elapsed:?}");
     }
 }

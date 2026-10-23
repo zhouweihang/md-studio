@@ -23,6 +23,8 @@ Dependency direction: `ui → adapters → application → core`. Rust is the fi
 - `src/ui/` must not import `@tauri-apps/api/core`; platform calls belong in `src/adapters/tauri/`.
 - All note access is `(root, relativePath)`; Rust canonicalizes and rejects `..`, absolute paths, symlink escapes, and non-Markdown extensions. Never bypass `notes.rs` with a new fs command without equivalent checks.
 - The filesystem is the source of truth. Do not add a content database/index without a new ADR.
+- Full-text search must go through Rust `search_notes` (RFC-002 / ADR-004); do not scan every file from React.
+- Delete is permanent after confirmation; rename keeps the directory and extension. Both must flush/cancel the autosave saver correctly.
 - Markdown preview output must pass through `DOMPurify` before `dangerouslySetInnerHTML`.
 - Autosave is 700ms; switching notes, Ctrl+S, and opening a workspace must `flush()` first.
 
@@ -54,4 +56,4 @@ Do not weaken path validation or sanitization to make a test pass. Report missin
 - CSP in `src-tauri/tauri.conf.json` is restrictive; new external origins need explicit allowance.
 - Tauri command arguments are single words today; keep JS/Rust names aligned if adding multi-word args (`camelCase` by default).
 - The first Rust release build is slow; debug build is much faster for iteration.
-- UI coverage is currently one App flow test (`src/ui/App.test.tsx`); component-level edge cases still need manual or added tests.
+- UI coverage is `src/ui/App.test.tsx` (open/search/rename/delete) plus `src/ui/NoteDialog.test.tsx`; some visual states still need manual checks.

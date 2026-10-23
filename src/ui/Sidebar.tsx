@@ -1,5 +1,6 @@
 import { useMemo, useState, type FormEvent } from 'react'
 import { filterNotes, type NoteEntry } from '../core/notes'
+import { highlightParts, type SearchHit } from '../core/search'
 import { buildNoteTree, type TreeNode } from '../core/tree'
 
 interface SidebarProps {
@@ -8,10 +9,13 @@ interface SidebarProps {
   activePath: string | null
   query: string
   loading: boolean
+  contentHits: SearchHit[]
+  searching: boolean
   onQueryChange: (query: string) => void
   onOpenWorkspace: () => void
   onRefresh: () => void
   onSelect: (note: NoteEntry) => void
+  onOpenHit: (hit: SearchHit) => void
   onCreate: (title: string) => void
 }
 
@@ -69,15 +73,19 @@ export function Sidebar({
   activePath,
   query,
   loading,
+  contentHits,
+  searching,
   onQueryChange,
   onOpenWorkspace,
   onRefresh,
   onSelect,
+  onOpenHit,
   onCreate,
 }: SidebarProps) {
   const [title, setTitle] = useState('')
   const filtered = useMemo(() => filterNotes(notes, query), [notes, query])
   const tree = useMemo(() => buildNoteTree(filtered), [filtered])
+  const hasQuery = query.trim().length > 0
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -134,7 +142,7 @@ export function Sidebar({
           type="search"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="按文件名或路径搜索"
+          placeholder="搜索文件名或正文"
           disabled={!root}
         />
         {query && (
@@ -159,11 +167,63 @@ export function Sidebar({
 
       <div className="tree-scroll">
         {!root && <p className="sidebar-empty">打开一个文件夹，开始整理你的 Markdown 笔记。</p>}
-        {root && filtered.length === 0 && (
-          <p className="sidebar-empty">{query ? '没有匹配的笔记。' : '这个工作区还没有 Markdown 文件。'}</p>
-        )}
-        {root && filtered.length > 0 && (
-          <TreeBranch nodes={tree} activePath={activePath} onSelect={onSelect} />
+        {root && (
+          <>
+            {hasQuery && (
+              <div className="search-status" aria-live="polite">
+                {searching ? '搜索正文中…' : `内容命中 ${contentHits.length} 条`}
+              </div>
+            )}
+
+            {filtered.length > 0 && (
+              <section className="tree-section">
+                {hasQuery && <div className="section-label">文件名匹配</div>}
+                <TreeBranch nodes={tree} activePath={activePath} onSelect={onSelect} />
+              </section>
+            )}
+
+            {contentHits.length > 0 && (
+              <section className="hits-section">
+                <div className="section-label">内容匹配</div>
+                <ul className="hits">
+                  {contentHits.map((hit) => (
+                    <li key={`${hit.path}:${hit.line}`}>
+                      <button
+                        type="button"
+                        className="hit"
+                        onClick={() => onOpenHit(hit)}
+                        title={`${hit.path}:${hit.line}`}
+                      >
+                        <span className="hit-path">
+                          <span className="hit-file">{hit.path}</span>
+                          <span className="hit-line">L{hit.line}</span>
+                        </span>
+                        <span className="hit-preview">
+                          {highlightParts(hit.preview, query).map((part, index) =>
+                            part.match ? (
+                              <mark key={index} className="hit-mark">
+                                {part.text}
+                              </mark>
+                            ) : (
+                              <span key={index}>{part.text}</span>
+                            ),
+                          )}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <p className="hits-limit">最多显示 50 条结果</p>
+              </section>
+            )}
+
+            {hasQuery && !searching && filtered.length === 0 && contentHits.length === 0 && (
+              <p className="sidebar-empty">没有匹配的笔记或正文。</p>
+            )}
+            {!hasQuery && filtered.length === 0 && (
+              <p className="sidebar-empty">这个工作区还没有 Markdown 文件。</p>
+            )}
+          </>
         )}
       </div>
 

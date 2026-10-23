@@ -6,6 +6,19 @@ export interface NoteEntry {
   modifiedMs: number | null
 }
 
+export interface NoteDocument {
+  content: string
+  /** Opaque change-detection token produced by the Rust read command. */
+  revision: string
+}
+
+export interface DeletedNote {
+  /** Relative path the note can be restored to. */
+  path: string
+  /** Text snapshot kept in memory for undo; null when too large or not UTF-8. */
+  content: string | null
+}
+
 export function filterNotes(notes: readonly NoteEntry[], query: string): NoteEntry[] {
   const needle = query.trim().toLocaleLowerCase()
   if (!needle) return [...notes]

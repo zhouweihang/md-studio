@@ -8,8 +8,11 @@
 
 - 选择任意本地文件夹作为工作区，递归发现 `.md/.markdown/.mdown`。
 - 目录树（目录优先、名称排序）与按文件名/路径搜索。
+- 全文搜索正文（大小写不敏感、行号、上下文片段），命中词在片段中高亮，点击直接定位到行。
+- 重命名当前笔记（保留目录与扩展名，冲突拒绝）；删除移入系统回收站，并可立即撤销。
 - 源码编辑 + GFM 实时预览（表格、任务列表、代码块），危险 HTML 经 DOMPurify 清理。
-- 700ms 防抖自动保存；`Ctrl+S` 立即保存；切换笔记前强制落盘。
+- 700ms 防抖自动保存；`Ctrl+S` 立即保存；切换笔记、切换工作区、关闭窗口前强制落盘。
+- 保存时比较内容 revision：文件被外部编辑器改过则拒绝覆盖，提供「重新载入」或「覆盖保存」。
 - 新建笔记，非法字符清洗，重名自动追加 `-2`、`-3`。
 - 记住上次工作区；保存状态、字数、行数、相对路径可见。
 - Rust 侧统一校验路径：拒绝 `..`、绝对路径、非 Markdown 扩展名与符号链接逃逸。
@@ -65,7 +68,10 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 
 更多设计：
 
-- 权威设计：[`docs/rfc/RFC-001-md-studio-mvp.md`](docs/rfc/RFC-001-md-studio-mvp.md)
+- 权威设计：[`docs/rfc/RFC-001-md-studio-mvp.md`](docs/rfc/RFC-001-md-studio-mvp.md)、[`RFC-002`](docs/rfc/RFC-002-note-management-and-search.md)、[`RFC-003`](docs/rfc/RFC-003-close-flush-and-conflicts.md)、[`RFC-004`](docs/rfc/RFC-004-trash-and-undo.md)、[`RFC-005`](docs/rfc/RFC-005-search-highlight-and-perf.md)
+- 搜索决策：[`ADR-004`](docs/adr/004-rust-scan-search.md)
+- 并发决策：[`ADR-005`](docs/adr/005-content-revision-concurrency.md)
+- 删除决策：[`ADR-006`](docs/adr/006-system-trash-and-snapshot-undo.md)
 - 决策记录：[`docs/adr/README.md`](docs/adr/README.md)
 - 结构现状：[`docs/architecture/C1-context.md`](docs/architecture/C1-context.md)、[`C2`](docs/architecture/C2-container.md)、[`C3`](docs/architecture/C3-component.md)
 - 实现快照：[`docs/specs/2026-10-23-md-studio-mvp-design.md`](docs/specs/2026-10-23-md-studio-mvp-design.md)
@@ -81,9 +87,12 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 
 ## 已知限制
 
-- 没有删除/重命名、全文搜索、文件监听、多标签。
-- 外部编辑器并发修改时采用最后写入获胜，没有冲突检测。
-- 关闭窗口时未强制 flush（切换笔记与 Ctrl+S 已覆盖）。
+- 全文搜索每次实时扫描，最多 50 条、每篇最多 3 条；大工作区的切换阈值见 ADR-004。
+- 没有文件监听、多标签；冲突只在保存时检测，不做后台轮询或三方合并。
+- 冲突检查与写入之间仍有极小的 TOCTOU 窗口，不引入跨平台文件锁（ADR-005）。
+- 撤销只覆盖最近一次删除且仅在当前会话；超过 5 MiB 或非 UTF-8 的文件仍可删除，但没有应用内撤销。
+- 恢复只写回内容与路径，不保留文件元数据；更早的删除请到系统回收站找回。
+- 搜索性能基线：1,001 篇笔记约 0.33s（debug 测试）；更大工作区仍按 ADR-004 评估是否引入索引。
 - 当前只验证 Windows；CI 跨平台矩阵尚未建立。
 
 完整清单与收尾标准见 [`docs/backlog.md`](docs/backlog.md)。

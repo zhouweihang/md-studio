@@ -13,9 +13,15 @@ const note: NoteEntry = {
 function repository(): NoteRepository {
   return {
     listNotes: vi.fn(async () => [note]),
-    readNote: vi.fn(async () => '# hello'),
-    writeNote: vi.fn(async () => {}),
+    readNote: vi.fn(async () => ({ content: '# hello', revision: 'rev-1' })),
+    writeNote: vi.fn(async () => 'rev-2'),
     createNote: vi.fn(async () => note),
+    deleteNote: vi.fn(async () => ({ path: note.path, content: '# hello' })),
+    restoreNote: vi.fn(async () => note),
+    renameNote: vi.fn(async () => note),
+    searchNotes: vi.fn(async () => [
+      { path: 'hello.md', title: 'hello', line: 1, preview: '# hello' },
+    ]),
   }
 }
 
@@ -25,14 +31,28 @@ describe('WorkspaceService', () => {
     const service = new WorkspaceService(port)
 
     expect(await service.list('/notes')).toEqual([note])
-    expect(await service.read('/notes', 'hello.md')).toBe('# hello')
-    await service.save('/notes', 'hello.md', '# updated')
+    expect(await service.read('/notes', 'hello.md')).toEqual({
+      content: '# hello',
+      revision: 'rev-1',
+    })
+    expect(await service.save('/notes', 'hello.md', '# updated', 'rev-1')).toBe('rev-2')
     expect(await service.create('/notes', 'hello')).toEqual(note)
+    expect(await service.delete('/notes', 'hello.md')).toEqual({
+      path: 'hello.md',
+      content: '# hello',
+    })
+    expect(await service.restore('/notes', 'hello.md', '# hello')).toEqual(note)
+    expect(await service.rename('/notes', 'hello.md', 'renamed')).toEqual(note)
+    expect(await service.search('/notes', 'hello')).toHaveLength(1)
 
     expect(port.listNotes).toHaveBeenCalledWith('/notes')
     expect(port.readNote).toHaveBeenCalledWith('/notes', 'hello.md')
-    expect(port.writeNote).toHaveBeenCalledWith('/notes', 'hello.md', '# updated')
+    expect(port.writeNote).toHaveBeenCalledWith('/notes', 'hello.md', '# updated', 'rev-1')
     expect(port.createNote).toHaveBeenCalledWith('/notes', 'hello')
+    expect(port.deleteNote).toHaveBeenCalledWith('/notes', 'hello.md')
+    expect(port.restoreNote).toHaveBeenCalledWith('/notes', 'hello.md', '# hello')
+    expect(port.renameNote).toHaveBeenCalledWith('/notes', 'hello.md', 'renamed')
+    expect(port.searchNotes).toHaveBeenCalledWith('/notes', 'hello')
   })
 
   it('propagates repository errors unchanged', async () => {
