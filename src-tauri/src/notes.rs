@@ -5,7 +5,7 @@ use crate::search::SearchHit;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_NOTES: usize = 50_000;
 const MAX_DEPTH: usize = 12;
 const MAX_TITLE_CHARS: usize = 80;
@@ -351,15 +351,29 @@ fn sanitize_title(input: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
-    let root = canonical_root(&root)?;
-    let paths = collect_note_paths(&root)?;
-    let mut notes = resolve_entries(&root, &paths);
+/// Lists a workspace without touching the search snapshot; also the entry point
+/// used by the benchmark and by the cold search path.
+pub(crate) fn list_note_entries_at(root: &Path) -> AppResult<Vec<NoteEntry>> {
+    let paths = collect_note_paths(root)?;
+    let mut notes = resolve_entries(root, &paths);
     // Precompute the lowercase key once per note instead of allocating twice
     // on every comparison.
     notes.sort_by_cached_key(|note| (note.path.to_ascii_lowercase(), note.path.clone()));
     Ok(notes)
+}
+
+#[tauri::command]
+pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
+    let notes = list_note_entries_at(&canonical_root(&root)?)?;
+    // Opening or refreshing a workspace starts the background warm-up; the UI
+    // never waits for it (RFC-006 §4.4).
+    crate::search::start_warm(&root, &notes);
+    Ok(notes)
+}
+
+#[tauri::command]
+pub fn snapshot_status() -> Option<crate::search::SnapshotStatus> {
+    crate::search::snapshot_status()
 }
 
 #[tauri::command]
@@ -417,6 +431,7 @@ pub fn write_note(
     }
 
     fs::write(&target, content.as_bytes()).map_err(|error| format!("cannot write note: {error}"))?;
+    crate::search::cache_upsert(&root, &path, &content);
 
     Ok(revision_for_bytes(content.as_bytes()))
 }
@@ -441,7 +456,9 @@ pub fn create_note(root: String, title: String) -> AppResult<NoteEntry> {
 
     fs::write(&target, b"").map_err(|error| format!("cannot create note: {error}"))?;
 
-    entry_for(&root, &target).ok_or_else(|| "cannot read the new note".to_string())
+    let entry = entry_for(&root, &target).ok_or_else(|| "cannot read the new note".to_string())?;
+    crate::search::cache_upsert(&root, &entry.path, "");
+    Ok(entry)
 }
 
 #[tauri::command]
@@ -474,10 +491,12 @@ where
 
     trash_fn(&target).map_err(|error| format!("cannot move note to trash: {error}"))?;
 
-    Ok(DeletedNote {
+    let deleted = DeletedNote {
         path: to_relative(&root, &target),
         content,
-    })
+    };
+    crate::search::cache_remove(&root, &deleted.path);
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -499,7 +518,10 @@ pub fn restore_note(root: String, path: String, content: String) -> AppResult<No
     fs::write(&target, content.as_bytes())
         .map_err(|error| format!("cannot restore note: {error}"))?;
 
-    entry_for(&root, &target).ok_or_else(|| "cannot read the restored note".to_string())
+    let entry =
+        entry_for(&root, &target).ok_or_else(|| "cannot read the restored note".to_string())?;
+    crate::search::cache_upsert(&root, &entry.path, &content);
+    Ok(entry)
 }
 
 #[tauri::command]
@@ -531,7 +553,11 @@ pub fn rename_note(root: String, path: String, new_title: String) -> AppResult<N
     }
 
     fs::rename(&source, &target).map_err(|error| format!("cannot rename note: {error}"))?;
-    entry_for(&root, &target).ok_or_else(|| "cannot read the renamed note".to_string())
+
+    let entry =
+        entry_for(&root, &target).ok_or_else(|| "cannot read the renamed note".to_string())?;
+    crate::search::cache_rename(&root, &path, &entry.path);
+    Ok(entry)
 }
 
 #[tauri::command]

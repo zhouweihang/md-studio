@@ -2,7 +2,7 @@ use std::env;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use md_studio_lib::search::search_notes_blocking;
+use md_studio_lib::search::{search_notes_blocking, warm_snapshot_blocking};
 
 struct Args {
     root: String,
@@ -10,6 +10,7 @@ struct Args {
     repeat: usize,
     warmup: usize,
     json: bool,
+    snapshot: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -18,6 +19,7 @@ fn parse_args() -> Result<Args, String> {
     let mut repeat = 30usize;
     let mut warmup = 5usize;
     let mut json = false;
+    let mut snapshot = true;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -45,9 +47,11 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|error| format!("invalid --warmup: {error}"))?
             }
             "--json" => json = true,
+            "--no-snapshot" => snapshot = false,
             "--help" | "-h" => {
                 println!(
-                    "usage: bench_search --root <dir> [--query needle] [--repeat 30] [--warmup 5] [--json]"
+                    "usage: bench_search --root <dir> [--query needle] [--repeat 30] \
+                     [--warmup 5] [--no-snapshot] [--json]"
                 );
                 std::process::exit(0);
             }
@@ -66,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         repeat,
         warmup,
         json,
+        snapshot,
     })
 }
 
@@ -89,6 +94,24 @@ fn run() -> Result<(), String> {
     let cold_start = Instant::now();
     let cold_hits = search_notes_blocking(&args.root, &args.query)?;
     let cold = cold_start.elapsed();
+
+    // Time the background warm-up the app performs after opening a workspace,
+    // then measure queries against the resulting snapshot (RFC-006 §4.4).
+    let mut warm_up = 0.0;
+    let mut cache = serde_json::Value::Null;
+    if args.snapshot {
+        let started = Instant::now();
+        let status = warm_snapshot_blocking(&args.root)?;
+        warm_up = ms(started.elapsed());
+        cache = serde_json::json!({
+            "state": status.state,
+            "total": status.total,
+            "cached": status.cached,
+            "bytes": status.bytes,
+            "budgetBytes": status.budget_bytes,
+            "degradedReason": status.degraded_reason
+        });
+    }
 
     for _ in 0..args.warmup {
         search_notes_blocking(&args.root, &args.query)?;
@@ -120,6 +143,9 @@ fn run() -> Result<(), String> {
             "warmP95Ms": ms(p95),
             "warmMinMs": ms(min),
             "warmMaxMs": ms(max),
+            "warmUpMs": warm_up,
+            "source": if args.snapshot { "snapshot" } else { "disk" },
+            "cache": cache,
             "peakRssMb": serde_json::Value::Null
         });
         println!(
@@ -131,6 +157,10 @@ fn run() -> Result<(), String> {
         println!("query:  {}", args.query);
         println!("hits:   {hits}");
         println!("cold:   {:.2} ms", ms(cold));
+        if args.snapshot {
+            println!("warmup: {warm_up:.2} ms (snapshot fill)");
+            println!("cache:  {cache}");
+        }
         println!("warm:   p50 {:.2} ms / p95 {:.2} ms", ms(p50), ms(p95));
         println!(
             "range:  {:.2} – {:.2} ms over {} runs ({} warmup)",

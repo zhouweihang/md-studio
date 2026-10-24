@@ -122,6 +122,8 @@ struct CacheEntry {
 - **单篇上限**：仍受 `MAX_FILE_BYTES = 5 MiB` 约束；超限或非 UTF-8 的笔记不进入快照，永远走实时读盘。
 - **清理**：切换工作区时丢弃整个快照；应用退出不持久化。
 
+实现（2026-10-24）：`Snapshot` 持有路径有序的 `Vec<SnapshotNote>`（`path/title` 用 `Arc<str>`，正文 `Option<Arc<str>>`）+ `path → index` + `tick → path` 的 `BTreeMap` 充当 LRU 链表；扫描时只克隆 `Arc`，锁在扫描前释放。`list_notes` 成功后调用 `start_warm`，换工作区（root 不匹配）时整体替换并丢弃旧快照；同工作区刷新只对账列表，保留已有正文，只为新路径排队。预热达到预算即停止读盘（剩余预算装不下 5 MiB 上限的单篇时收工），不读完整个工作区再淘汰；LRU 淘汰仍用于应用内写入促成的插入。应用内写/新建/删除/改名/恢复会同步镜像快照（外部编辑器修改要等 ADR-009 监听落地）。预热用普通 `std::thread` 而不用 `spawn_blocking`：工作不依赖 async runtime，基准可同步复用。为服务毫秒级目标，ASCII needle 改为整篇扫描 + 命中处回算行号（逐行 `find` 在 10k 档有千万次调用），快照路径线程上限 16、磁盘路径仍为 8。
+
 ### 4.5 流式契约（REQ-026）
 
 ```rust
@@ -207,8 +209,8 @@ pub fn search_cancel(request_id: u64);
 |---|---|---|
 | REQ-022 | 1k 基准 ≥10% 提升；匹配语义用例全绿 | **通过 2026-10-23**：暖 p50 1k −30.1%、10k −28.9%、50k −26.6%；`aho-corasick` ASCII 匹配、按需片段、排序 key 预计算、搜索路径去 canonicalize；Rust 26 passed |
 | REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | **通过 2026-10-24**：1k 暖 p50 83.7 ms / p95 93.3 ms，10k 793.8 ms，50k 4,322.1 ms（L0 为 290.3 / 2,880.8 / 14,881.8）；跨块顺序由块序拼接 + 主线程截断保证，`parallel_scan_matches_serial_scan_hit_for_hit` 逐条比对；Rust 27 passed |
-| REQ-024 | 10k 暖查询 p95 ≤20 ms；LRU 单测 | 待实现（plan Task 4） |
-| REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | 待实现（plan Task 4） |
+| REQ-024 | 10k 暖查询 p95 ≤20 ms；LRU 单测 | **部分通过 2026-10-24**：暖 p50 1k 4.1 / 10k 19.8 / 50k 2,509.8 ms（L1 为 83.7 / 793.8 / 4,322.1），p95 15.3 / **28.4** / 2,657.1 ms；LRU 预算/淘汰/记账单测覆盖，零缓存与部分缓存结果逐条等于实时扫描。p95 未达标：215.6 MiB 正文下 20 ms 需约 11 GB/s，实测 11–12 GB/s（p50 18–20 ms），差额是调度抖动；按字节计已在该带宽。待 RFC 修订裁决 SLO 或转 ADR-010 |
+| REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | **通过 2026-10-24**：`list_notes` 返回后后台预热（1k 225 ms / 10k 2.21 s / 50k 8.25 s），UI 不等待；`snapshot_status` 返回 `Warming/Ready/Degraded` 与 total/cached/bytes/budget；预算耗尽记 `Ready` 且部分命中，全部读失败记 `Degraded`，未就绪或降级时全程回退实时扫描 |
 | REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | 待实现（plan Task 5） |
 | REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | 待实现（plan Task 6） |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |

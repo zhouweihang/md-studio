@@ -1,6 +1,6 @@
 {
   "tier": "dev-i9-14900hx",
-  "capturedAt": "2026-10-23",
+  "capturedAt": "2026-10-24",
   "machine": {
     "cpu": "Intel(R) Core(TM) i9-14900HX",
     "cores": 32,
@@ -14,54 +14,79 @@
   "query": "needle",
   "results": {
     "1000": {
-      "coldMs": 83.2961,
+      "cache": {
+        "budgetBytes": 268435456,
+        "bytes": 28604339,
+        "cached": 1000,
+        "degradedReason": null,
+        "state": "ready",
+        "total": 1000
+      },
+      "coldMs": 65.8993,
       "hits": 1,
       "peakRssMb": null,
       "query": "needle",
       "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\1000",
       "runs": 30,
-      "warmMaxMs": 94.72540000000001,
-      "warmMinMs": 80.9911,
-      "warmP50Ms": 83.6644,
-      "warmP95Ms": 93.3252,
+      "source": "snapshot",
+      "warmMaxMs": 17.5947,
+      "warmMinMs": 2.9254,
+      "warmP50Ms": 4.1284,
+      "warmP95Ms": 15.3056,
+      "warmUpMs": 225.2296,
       "warmup": 5,
       "notes": 1000,
       "bytes": 28573385
     },
     "10000": {
-      "coldMs": 800.8779000000001,
+      "cache": {
+        "budgetBytes": 268435456,
+        "bytes": 226100215,
+        "cached": 10000,
+        "degradedReason": null,
+        "state": "ready",
+        "total": 10000
+      },
+      "coldMs": 642.5016999999999,
       "hits": 1,
       "peakRssMb": null,
       "query": "needle",
       "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\10000",
-      "runs": 20,
-      "warmMaxMs": 821.1551999999999,
-      "warmMinMs": 775.7728999999999,
-      "warmP50Ms": 793.8495,
-      "warmP95Ms": 815.8483,
+      "runs": 30,
+      "source": "snapshot",
+      "warmMaxMs": 30.2288,
+      "warmMinMs": 15.845600000000001,
+      "warmP50Ms": 19.8063,
+      "warmP95Ms": 28.4187,
+      "warmUpMs": 2211.4653999999996,
       "warmup": 5,
       "notes": 10000,
       "bytes": 225788729
     },
     "50000": {
-      "coldMs": 4028.9845,
+      "cache": {
+        "budgetBytes": 268435456,
+        "bytes": 264388314,
+        "cached": 11520,
+        "degradedReason": null,
+        "state": "ready",
+        "total": 50000
+      },
+      "coldMs": 3302.899,
       "hits": 1,
       "peakRssMb": null,
       "query": "needle",
       "root": "E:\\project\\markdown软件\\md-studio\\target\\bench-corpus\\50000",
-      "runs": 10,
-      "warmMaxMs": 4418.062,
-      "warmMinMs": 4191.0243,
-      "warmP50Ms": 4322.0672,
-      "warmP95Ms": 4418.062,
+      "runs": 30,
+      "source": "snapshot",
+      "warmMaxMs": 2692.9474,
+      "warmMinMs": 1916.7882,
+      "warmP50Ms": 2509.8212000000003,
+      "warmP95Ms": 2657.075,
+      "warmUpMs": 8248.186,
       "warmup": 5,
       "notes": 50000,
       "bytes": 1138251705
     }
-  },
-  "methodology": {
-    "cold": "fresh process; antivirus first-touch inflates the first read on this corpus, so cold is informational and not gated",
-    "percentile": "nearest-rank over warm runs",
-    "note": "RFC-006 L1 applied (parallel chunked scan + parallel workspace stat); baseline is pre-L0. Sidebar virtualization and the memory snapshot are not part of this measurement."
   }
 }

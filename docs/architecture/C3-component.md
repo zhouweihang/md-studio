@@ -1,6 +1,6 @@
 # C3: Component 视图
 
-> C4 Level 3 | 对应 RFC-001、RFC-006 | Updated: 2026-10-23 | 状态：反映 MVP 的域分解；RFC-006 的搜索快照、流式与监听标注为计划态
+> C4 Level 3 | 对应 RFC-001、RFC-006 | Updated: 2026-10-24 | 状态：反映 MVP 的域分解；RFC-006 的搜索快照已实现，流式与监听仍标注为计划态
 
 ## 1. 总览图
 
@@ -95,7 +95,7 @@ flowchart TB
 |---|---|---|
 | 命令层 | `list_notes` / `read_note` / `write_note` / `create_note` / `delete_note` / `restore_note` / `rename_note` / `search_notes` 注册 | `src-tauri/src/lib.rs` |
 | 文件域 | 根规范化、相对路径校验、递归扫描（串行枚举 + 并行 stat，≤8 线程）、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
-| 搜索引擎（计划） | 内存快照、LRU 预算、并行匹配、片段生成、请求取消 | `src-tauri/src/search.rs` |
+| 搜索引擎 | 内存快照（后台预热、LRU 预算、`Warming/Ready/Degraded`）、并行匹配、整篇扫描、片段生成；请求取消与流式待 Task 5 | `src-tauri/src/search.rs` |
 | 文件监听（计划） | notify 递归监听、300 ms 去抖、增量更新快照与降级状态 | `src-tauri/src/watcher.rs` |
 
 ## 3. 数据流
@@ -127,13 +127,13 @@ flowchart TB
 
 ### 3.5 全文搜索
 
-现状（v0.1.0）：
+现状（v0.1.0 + RFC-006 L2）：
 
 1. 查询变化 → 250ms 防抖 → `WorkspaceService.search` → `invoke('search_notes')`。
-2. Rust 复用 `list_notes` 扫描结果，逐篇读取正文、逐行匹配，返回 `SearchHit[]`。
+2. Rust 优先在内存快照上并行扫描（打开工作区后在后台预热）；快照未就绪、条目被淘汰、超限或非 UTF-8 时逐篇回退读盘，结果与顺序不变。
 3. `Sidebar` 同时渲染文件名树与内容命中；`highlightParts(preview, query)` 把命中词切分为 `<mark>`；点击命中调用 `openNote(note, line)`，`EditorPane` 定位到行。
 
-RFC-006 计划（未实现）：
+RFC-006 剩余（未实现）：
 
 1. 打开工作区 → 后台预热内存快照（`search.rs`），状态 `Warming → Ready`。
 2. 查询 → 自适应防抖 80/120/200 ms → `search_notes(root, query, request_id, channel)`。
@@ -161,11 +161,11 @@ RFC-006 计划（未实现）：
 3. 成功后刷新列表并 `openNote(restored)` 重新读取 revision；toast 关闭。
 4. 8 秒无操作后 toast 自动消失，撤销入口结束；更早的文件由系统回收站找回。
 
-### 3.9 搜索快照与失效（RFC-006，计划）
+### 3.9 搜索快照与失效（RFC-006 Task 4 已实现；监听与流式待 Task 5/6）
 
-1. 打开工作区：`snapshot_status` 进入 `Warming`，64 篇一批读入，不阻塞编辑。
-2. 查询：快照命中走内存并行扫描；未就绪、被淘汰、超限或非 UTF-8 回退读盘。
-3. 失效：notify 事件 300 ms 去抖后增量更新；监听失败置 `Degraded`；手动刷新全量对账。
+1. 打开工作区：`list_notes` 返回后后台预热，`snapshot_status` 进入 `Warming`，64 篇一批读入，不阻塞编辑；预算满即停。
+2. 查询：快照命中走内存并行扫描；未就绪、被淘汰、超限或非 UTF-8 回退读盘。应用内写/新建/删除/改名/恢复同步镜像快照。
+3. 失效：notify 事件 300 ms 去抖后增量更新；监听失败置 `Degraded`；手动刷新全量对账。**当前外部编辑要等 Task 6 才能被快照感知。**
 4. 取消：`request_id` 单调递增，工作线程每批检查，前端丢弃迟到批次。
 5. 边界：快照只读；保存仍读盘比对 revision（ADR-005），删除/恢复/重命名语义不变。
 
@@ -212,5 +212,6 @@ RFC-006 计划（未实现）：
 - 2026-10-23 RFC-005：内容命中片段高亮查询词；新增 1,000 篇笔记的 Rust 搜索耗时回归测试。
 - 2026-10-23 RFC-005 验证：前端 36 passed、Rust 22 passed、1,001 篇搜索实测 330.97ms、typecheck/build/NSIS 1.52 MiB/docs PASS。
 - 2026-10-23 RFC-006：搜索计划改为「内存快照 + 并行 + Channel 流式」，新增 `search.rs` / `watcher.rs` 规划，`MAX_NOTES` 目标 50k 并配套侧栏虚拟化；当前代码尚未实现。
+- 2026-10-24 RFC-006 L2：`search.rs` 新增只读快照（预热、LRU 预算、三态）与 `snapshot_status` 命令；查询优先读快照、逐篇回退读盘；写/删/改名/恢复同步镜像；ASCII needle 改为整篇扫描。前端与监听/流式仍未接入（Task 5/6）。
 - 2026-10-24 RFC-006 L0/L1：`search.rs` 承载匹配与片段生成（L0）并按块并行扫描（L1，`std::thread::scope`、≤8 线程）；`notes.rs` 的扫描拆为串行枚举 + 并行 stat。分层与命令契约未变。
 - 2026-10-24 RFC-006 L0/L1 验证：Rust 27 passed、`check:perf` PASS（1k 415.5→83.7 ms）；内存快照、流式与监听仍未实现。
