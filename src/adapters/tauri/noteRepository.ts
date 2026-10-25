@@ -1,6 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import type { NoteRepository } from '../../application/ports'
-import type { DeletedNote, NoteDocument, NoteEntry } from '../../core/notes'
+import type { DeletedNote, NoteDocument, NoteEntry, WorkspaceDelta } from '../../core/notes'
 import type {
   SearchHit,
   SearchSource,
@@ -18,6 +19,9 @@ type SearchEvent =
       tookMs: number
       source: SearchSource
     }
+
+/** Mirrors `watcher::WORKSPACE_EVENT` in Rust (ADR-009). */
+const WORKSPACE_EVENT = 'workspace:changed'
 
 const EMPTY_SUMMARY: SearchSummary = {
   total: 0,
@@ -99,5 +103,9 @@ export class TauriNoteRepository implements NoteRepository {
 
   snapshotStatus(): Promise<SnapshotStatus | null> {
     return invoke<SnapshotStatus | null>('snapshot_status')
+  }
+
+  onWorkspaceChanged(handler: (delta: WorkspaceDelta) => void): Promise<() => void> {
+    return listen<WorkspaceDelta>(WORKSPACE_EVENT, (event) => handler(event.payload))
   }
 }

@@ -1,4 +1,4 @@
-import type { DeletedNote, NoteDocument, NoteEntry } from '../core/notes'
+import type { DeletedNote, NoteDocument, NoteEntry, WorkspaceDelta } from '../core/notes'
 import type { SearchHit, SearchSummary, SnapshotStatus } from '../core/search'
 
 export interface NoteRepository {
@@ -22,6 +22,11 @@ export interface NoteRepository {
   /** Asks the backend to stop a streamed search; late batches are dropped. */
   cancelSearch(requestId: number): Promise<void>
   snapshotStatus(): Promise<SnapshotStatus | null>
+  /**
+   * Subscribes to watcher-driven note-list deltas (ADR-009) and resolves with
+   * the unsubscribe function.
+   */
+  onWorkspaceChanged(handler: (delta: WorkspaceDelta) => void): Promise<() => void>
 }
 
 export interface WorkspacePicker {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use md_studio_lib::search::{
-    SearchEvent, SearchSource, search_notes_blocking, search_stream_blocking,
+    SearchEvent, SearchSource, degrade_snapshot, search_notes_blocking, search_stream_blocking,
     warm_snapshot_blocking,
 };
 
@@ -64,6 +64,9 @@ struct Args {
     warmup: usize,
     json: bool,
     snapshot: bool,
+    /// Mark the snapshot `Degraded` after warming so every query pays the
+    /// mtime+size revalidation pass (RFC-006 §4.6).
+    degraded: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -73,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
     let mut warmup = 5usize;
     let mut json = false;
     let mut snapshot = true;
+    let mut degraded = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -101,10 +105,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = true,
             "--no-snapshot" => snapshot = false,
+            "--degraded" => degraded = true,
             "--help" | "-h" => {
                 println!(
                     "usage: bench_search --root <dir> [--query needle] [--repeat 30] \
-                     [--warmup 5] [--no-snapshot] [--json]"
+                     [--warmup 5] [--no-snapshot | --degraded] [--json]"
                 );
                 std::process::exit(0);
             }
@@ -116,6 +121,9 @@ fn parse_args() -> Result<Args, String> {
     if repeat == 0 {
         return Err("--repeat must be at least 1".to_string());
     }
+    if degraded && !snapshot {
+        return Err("--degraded needs the snapshot (drop --no-snapshot)".to_string());
+    }
 
     Ok(Args {
         root,
@@ -124,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
         warmup,
         json,
         snapshot,
+        degraded,
     })
 }
 
@@ -164,6 +173,10 @@ fn run() -> Result<(), String> {
             "budgetBytes": status.budget_bytes,
             "degradedReason": status.degraded_reason
         });
+    }
+
+    if args.degraded {
+        degrade_snapshot(&args.root, "benchmark: degraded mode")?;
     }
 
     for _ in 0..args.warmup {
@@ -211,6 +224,7 @@ fn run() -> Result<(), String> {
                 SearchSource::Disk => "disk",
                 SearchSource::Mixed => "mixed",
             },
+            "degraded": args.degraded,
             "cache": cache,
             "peakRssMb": serde_json::Value::Null
         });
@@ -226,6 +240,9 @@ fn run() -> Result<(), String> {
         if args.snapshot {
             println!("warmup: {warm_up:.2} ms (snapshot fill)");
             println!("cache:  {cache}");
+        }
+        if args.degraded {
+            println!("mode:   degraded (mtime+size revalidation before every query)");
         }
         println!("warm:   p50 {:.2} ms / p95 {:.2} ms", ms(p50), ms(p95));
         println!(

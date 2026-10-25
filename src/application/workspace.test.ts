@@ -25,6 +25,7 @@ function repository(): NoteRepository {
     }),
     cancelSearch: vi.fn(async () => {}),
     snapshotStatus: vi.fn(async () => null),
+    onWorkspaceChanged: vi.fn(async () => () => {}),
   }
 }
 
@@ -67,6 +68,11 @@ describe('WorkspaceService', () => {
     expect(port.restoreNote).toHaveBeenCalledWith('/notes', 'hello.md', '# hello')
     expect(port.renameNote).toHaveBeenCalledWith('/notes', 'hello.md', 'renamed')
     expect(port.searchNotes).toHaveBeenCalledWith('/notes', 'hello', 7, batch)
+
+    const onDelta = vi.fn()
+    const stop = await service.onWorkspaceChanged(onDelta)
+    expect(port.onWorkspaceChanged).toHaveBeenCalledWith(onDelta)
+    stop()
   })
 
   it('propagates repository errors unchanged', async () => {

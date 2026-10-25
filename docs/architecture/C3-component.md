@@ -96,7 +96,7 @@ flowchart TB
 | 命令层 | `list_notes` / `read_note` / `write_note` / `create_note` / `delete_note` / `restore_note` / `rename_note` / `search_notes` / `search_cancel` / `snapshot_status` 注册 | `src-tauri/src/lib.rs` |
 | 文件域 | 根规范化、相对路径校验、递归扫描（串行枚举 + 并行 stat，≤8 线程）、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
 | 搜索引擎 | 内存快照（后台预热、LRU 预算、`Warming/Ready/Degraded`）、并行匹配、整篇扫描、片段生成；`SearchEvent` 流式（Batch ≤16 / 唯一 Done / `request_id` 取消）；`Degraded` 时按 mtime+size 校验缓存正文 | `src-tauri/src/search.rs` |
-| 文件监听 | `notify` 递归监听、300 ms 去抖、事件归约为「磁盘现在是什么」、移除目录连带清理、连续读失败置 `Degraded`；生命周期跟随工作区（`list_notes` 重建） | `src-tauri/src/watcher.rs` |
+| 文件监听 | `notify` 递归监听、300 ms 去抖、事件归约为「磁盘现在是什么」、移除目录连带清理、连续读失败置 `Degraded`；把新增/删除汇成 `WorkspaceDelta` 推给前端；生命周期跟随工作区（`list_notes` 重建） | `src-tauri/src/watcher.rs` |
 
 ## 3. 数据流
 
@@ -161,9 +161,10 @@ flowchart TB
 
 1. 打开工作区：`list_notes` 返回后后台预热，`snapshot_status` 进入 `Warming`，64 篇一批读入，不阻塞编辑；预算满即停。
 2. 查询：快照命中走内存并行扫描；未就绪、被淘汰、超限或非 UTF-8 回退读盘。应用内写/新建/删除/改名/恢复同步镜像快照。
-3. 失效：`notify` 事件 300 ms 去抖后归约为「磁盘现在是什么」——存在的 Markdown 重读、消失的删除、目录删除连带清空；隐藏/构建目录忽略。监听初始化失败、后端溢出或连续读失败置 `Degraded`，此后每次查询先用 mtime+size 校验缓存正文，失配的丢弃并后台重预热；手动刷新按 mtime 对账重建。
-4. 取消：`request_id` 单调递增，工作线程每批检查，前端丢弃迟到批次。
-5. 边界：快照只读；保存仍读盘比对 revision（ADR-005），删除/恢复/重命名语义不变。
+3. 失效：`notify` 事件 300 ms 去抖后归约为「磁盘现在是什么」——存在的 Markdown 重读、消失的删除、目录删除连带清空；隐藏/构建目录忽略。监听初始化失败、后端溢出或连续读失败置 `Degraded`，此后每次查询先用 mtime+size 校验缓存正文（16 线程并行，10k 档约 169 ms），失配的丢弃并后台重预热；手动刷新按 mtime 对账重建。
+4. 文件树：同一批量把新增/删除累积成 `WorkspaceDelta`，经 `workspace:changed` 推给前端，App 用 `applyWorkspaceDelta` 就地 patch `notes`；正文修改（`Updated`）不发事件，因此自动保存不会引起树刷新。
+5. 取消：`request_id` 单调递增，工作线程每批检查，前端丢弃迟到批次。
+6. 边界：快照只读；保存仍读盘比对 revision（ADR-005），删除/恢复/重命名语义不变。
 
 ## 4. 部署与运行时
 
@@ -212,3 +213,4 @@ flowchart TB
 - 2026-10-24 RFC-006 L0/L1：`search.rs` 承载匹配与片段生成（L0）并按块并行扫描（L1，`std::thread::scope`、≤8 线程）；`notes.rs` 的扫描拆为串行枚举 + 并行 stat。分层与命令契约未变。
 - 2026-10-24 RFC-006 L0/L1 验证：Rust 27 passed、`check:perf` PASS（1k 415.5→83.7 ms）；内存快照、流式与监听仍未实现。
 - 2026-10-25 RFC-006 Task 5/6：`search_notes` 改为 Channel 流式并新增 `search_cancel`；`watcher.rs` 落地 notify 监听（300 ms 去抖、磁盘现状归约、`Degraded` + mtime+size 校验）；状态栏新增快照三态与缓存大小。Rust 49 passed、前端 55 passed。
+- 2026-10-25 RFC-006 Task 6 补：监听事件以 `workspace:changed` 增量更新侧栏（`WorkspaceDelta` + `applyWorkspaceDelta`，正文修改不发事件）；降级查询改为 16 线程并行校验（10k 档从 689 ms 降到 183 ms），`bench_search --degraded` 可复现；NSIS `1.73 MiB`。Rust 50 passed、前端 61 passed。

@@ -6,7 +6,7 @@
 
 **Goal:** 把搜索从「每次查询重扫磁盘」重构为「后台预热的内存快照 + 并行扫描 + Channel 流式返回」，10k 档暖查询 p95 ≤ 41.6 ms（= 20 ms 固定开销 + 0.10 ms/MiB × 215.6 MiB，2026-10-25 修订），50k 档可打开可搜索，并建立分机器基线的回归门禁。
 
-**Status:** In progress（Task 0–6 完成；下一步 Task 7，其中侧栏虚拟化按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，完成 Task 5 流式契约与 Task 6 监听失效，均已回填 RFC-006。
+**Status:** In progress（Task 0–6、Task 8 完成；Task 7 的 50k 上限已提前完成，仅侧栏虚拟化按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，完成 Task 5 流式契约、Task 6 监听失效与文件树增量、Task 8 全量验证（NSIS 1.73 MiB），均已回填 RFC-006。
 
 **权威文档：** `docs/rfc/RFC-006-search-performance.md`、`docs/specs/2026-10-23-search-performance-design.md`、ADR-007~009。
 
@@ -152,7 +152,7 @@
 - [x] **Step 5**: 集成测试：外部写入、删除、rename 原子保存三种路径。
 - [x] **Step 6**: `cargo test --locked --all-targets`（49 passed）。
 
-**验收**：外部编辑 500 ms 内可见；监听被禁用时结果仍正确、状态为 `Degraded`。
+**验收**：外部编辑 500 ms 内可见；监听被禁用时结果仍正确、状态为 `Degraded`；外部新建/改名无需手动刷新即可出现在侧栏。
 
 **结果（2026-10-25，本机 Windows）**
 
@@ -165,6 +165,8 @@
 | 忽略目录 | `node_modules`、`.git` 内的 `.md` 不进入快照 | `ignored_folders_never_enter_the_snapshot` |
 | 监听禁用 | `Degraded` 下查询前 mtime+size 校验，外部修改仍被搜到，后台重预热 | `degraded_snapshot_revalidates_before_returning_hits` |
 | 切换工作区 | 监听重建，旧根不再监听 | `watching_is_reused_and_rebound_across_workspaces` |
+| 外部新建/改名（文件树） | `workspace:changed` 推 `WorkspaceDelta`，前端 `applyWorkspaceDelta` 就地 patch，不重新 `list_notes`；正文修改不发事件 | `tree_delta_reports_creates_and_renames_but_not_edits`、`applyWorkspaceDelta` 单测、App 订阅用例 |
+| 10k 降级查询 | p50 **183.2 ms** / p95 186.7 ms（校验 169 + 扫描 14.6），磁盘扫描 755 ms | `bench_search --degraded --repeat 15` |
 
 **实现备注**
 
@@ -175,6 +177,8 @@
 5. 测试断言 1.5 s 上限而不是 500 ms：去抖 300 ms + 事件投递在空闲机器上稳定在 300–400 ms，CI 的慢盘不该把验收口径变成偶发失败；上限只用于捕获「忘记 flush」这类结构性回归。
 6. `notify` 8.2.1（稳定版）；9.x 仍是 rc，不采用。
 7. 状态栏（`StatusBar`）常驻展示 `Warming/Ready/Degraded`、缓存字节数与 `cached/total`，`Degraded` 的 `degradedReason` 挂在 tooltip；`Warming` 时 App 每 400 ms 轮询 `snapshot_status` 直到稳定。
+8. 降级查询成本：`bench_search --degraded` 先预热再 `mark_degraded`，每查询都走校验。10k 档单线程 `stat` 为 689 ms p50，几乎等于完整磁盘扫描（755 ms），缓存失去意义；改为按 `MAX_SNAPSHOT_THREADS`（16）分块并行后为 **183.2 ms p50 / 186.7 ms p95**，即校验约 169 ms、扫描 14.6 ms。8 线程为 203.6 ms，16 线程才是这一档的拐点。降级模式因此仍值得保留快照（比磁盘快 4 倍），但不应被当作长态——监听恢复或手动刷新会把它拉回 `Ready`。
+9. watcher 的增量事件同时驱动文件树：`flush` 把「新出现的路径」和「消失的路径」累积成 `WorkspaceDelta`，经 `workspace:changed` 事件推给前端；普通正文修改（`Updated`）不发事件，否则每次自动保存都会刷新树。前端用 `applyWorkspaceDelta` 就地 patch `notes`，不重新 `list_notes`。
 
 ## Task 7: 50k 上限与侧栏虚拟化（REQ-028）
 
@@ -190,12 +194,14 @@
 
 ## Task 8: 全量验证与回填
 
-- [ ] **Step 1**: `node scripts/check-eng-docs.cjs`。
-- [ ] **Step 2**: `bun run typecheck`、`bun run test`、`bun run build`。
-- [ ] **Step 3**: `cargo test --locked --all-targets`。
-- [ ] **Step 4**: `bun run tauri build`（NSIS，记录体积）。
+- [x] **Step 1**: `node scripts/check-eng-docs.cjs`（ERROR 0 / WARN 0）。
+- [x] **Step 2**: `bun run typecheck`、`bun run test`（61 passed）、`bun run build`。
+- [x] **Step 3**: `cargo test --locked --all-targets`（50 passed）。
+- [x] **Step 4**: `bun run tauri build`（NSIS 1.73 MiB，见下方记录）。
 - [x] **Step 5**: 门禁脚本 `check-search-perf.mjs` 已实现，并用基线自检 PASS 与 FAIL 两条路径；基准仍不进 CI。
-- [ ] **Step 6**: 回填 RFC-006 §6/§8、README、knowledge.md、C3、backlog 状态。
+- [x] **Step 6**: 回填 RFC-006 §6/§8、README、C3、backlog 状态（`knowledge.md` 在仓库根目录之外，不属于本仓库，无法提交）。
+
+**构建记录（2026-10-25）**：`MD Studio_0.1.0_x64-setup.exe` **1,811,099 B ≈ 1.73 MiB**（release，LTO + strip）。首次 `tauri build` 失败在「failed to find main binary」：`bench_search` 让包内有了两个 bin，而 Cargo.toml 没有 `default-run`；补 `default-run = "md-studio"` 后通过。构建日志无 Rust/Cargo warning（release 编译阶段沿用首次尝试的缓存，未重打）。
 
 ---
 

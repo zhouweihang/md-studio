@@ -26,6 +26,23 @@ pub struct NoteEntry {
     pub modified_ms: Option<u64>,
 }
 
+/// Incremental change to the note list, pushed to the UI by the watcher so the
+/// sidebar tracks external edits without a full `list_notes` refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDelta {
+    /// Notes that appeared (created or renamed into the workspace).
+    pub added: Vec<NoteEntry>,
+    /// Relative paths that no longer exist.
+    pub removed: Vec<String>,
+}
+
+impl WorkspaceDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteDocument {
@@ -375,7 +392,9 @@ pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
     crate::search::start_warm(&root, &notes);
     // Watching is best-effort (ADR-009): without it the snapshot still answers
     // queries, but every query first revalidates cached bodies by mtime+size.
-    if let Err(reason) = crate::watcher::watch_workspace(&root_path) {
+    if let Err(reason) =
+        crate::watcher::watch_workspace(&root_path, crate::watcher::global_emitter())
+    {
         crate::search::mark_degraded(&root_path, &reason);
     }
     Ok(notes)

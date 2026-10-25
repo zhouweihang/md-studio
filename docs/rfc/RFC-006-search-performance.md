@@ -166,7 +166,9 @@ pub fn search_cancel(request_id: u64);
 
 - `notify` 递归监听工作区，只处理 `.md/.markdown/.mdown` 与目录事件，隐藏目录、`node_modules`、`target`、`dist`、`build` 继续忽略。
 - 事件去抖 300 ms 后合并处理：`create/modify` 重读该文件，`remove` 删条目，`rename` 删旧键插新键。
+- 同一事件流同时驱动侧栏：新增/删除/改名以 `workspace:changed` 增量推送（`WorkspaceDelta`），正文修改不发事件，避免自动保存刷新树；前端就地 patch 列表，不重新 `list_notes`。
 - 监听初始化失败、事件溢出或连续读失败 → `Degraded`；此后每次查询先对缓存正文做 mtime+size 校验，不一致则丢弃该正文、回退读盘并在后台重预热。`Degraded` 不整体回退磁盘扫描，代价是每查询一轮 `stat`。
+- 校验开销（2026-10-25 实测，10k 档 215.6 MiB）：并行 16 线程 `stat` 约 169 ms/查询（p50 183.2 ms vs `Ready` 14.6 ms），单线程则要 690 ms；完整磁盘扫描为 755 ms。`bench_search --degraded` 可复现，所以计算继续留在快照上。
 - 手动刷新执行全量对账：重新遍历并重建快照。
 - 原子保存（临时文件 + rename）依赖 rename/create 事件；集成测试必须覆盖该路径。
 
@@ -222,7 +224,7 @@ pub fn search_cancel(request_id: u64);
 | REQ-024 | 全缓存时暖查询 p95 ≤ 20 ms + 0.10 ms/MiB 已缓存正文；LRU 单测 | **通过 2026-10-25（SLO 同日修订，见 §1 注）**：暖 p50 1k 4.1 / 10k 19.8 / 50k 2,509.8 ms（L1 为 83.7 / 793.8 / 4,322.1），p95 15.3 / 28.4 / 2,657.1 ms。对 1k（27.3 MiB）预算 22.7 ms、10k（215.6 MiB）预算 41.6 ms，两档余量均约 32%，说明「固定项 + 线性项」模型与实测吻合。LRU 预算/淘汰/记账单测覆盖，零缓存与部分缓存结果逐条等于实时扫描。50k 因 256 MB 预算只缓存 11,520 / 50,000 篇，属部分缓存，按「结果与实时扫描逐条一致 + 记录 cached/total」验收，不套用该 SLO |
 | REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | **通过 2026-10-24**：`list_notes` 返回后后台预热（1k 225 ms / 10k 2.21 s / 50k 8.25 s），UI 不等待；`snapshot_status` 返回 `Warming/Ready/Degraded` 与 total/cached/bytes/budget；预算耗尽记 `Ready` 且部分命中，全部读失败记 `Degraded`，未就绪时回退实时扫描；状态栏常驻展示三态、缓存字节数与 `cached/total`（`StatusBar` 用例 5 条） |
 | REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | **通过 2026-10-25**：`search_stream_blocking` 以批次 ≤16 发送、`Done` 唯一（单测断言事件数与末事件）；取消后不再发 `Done`、不报错，前端按 `requestId` 丢弃迟到批次（App 测试）；旧的一次性 `invoke('search_notes')` 签名已无调用方，`SearchHit[]` 不再穿过命令边界；Rust 42 passed、前端 47 passed |
-| REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | **通过 2026-10-25**：`notify` 递归监听 + 300 ms 去抖；外部写入、删除、目录删除、原子保存（临时文件 + rename）四条集成测试断言 1.5 s 内可见（本机实测 300–400 ms，测试上限只用于捕获「flush 丢失」这类回归）；监听失败与事件溢出置 `Degraded`，查询前按 mtime+size 校验并重读失配条目，降级用例断言无监听时外部修改仍能被搜到；忽略目录用例断言 `node_modules`、`.git` 不进入快照；Rust 49 passed |
+| REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | **通过 2026-10-25**：`notify` 递归监听 + 300 ms 去抖；外部写入、删除、目录删除、原子保存（临时文件 + rename）四条集成测试断言 1.5 s 内可见（本机实测 300–400 ms，测试上限只用于捕获「flush 丢失」这类回归）；监听失败与事件溢出置 `Degraded`，查询前按 mtime+size 校验并重读失配条目，降级用例断言无监听时外部修改仍能被搜到；降级查询 10k 档 p50 183.2 ms / p95 186.7 ms（= 14.6 ms 扫描 + 约 169 ms 校验），仍快于完整磁盘扫描的 755 ms（`bench_search --degraded`）；忽略目录用例断言 `node_modules`、`.git` 不进入快照；文件树用例断言外部新建/改名以 `WorkspaceDelta` 推送、正文修改不发事件；Rust 50 passed |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |
 | REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | **通过 2026-10-25**：`searchDebounceMs` 覆盖 80/120/200 三档（单测），App 在 `Warming`/无快照时取 200 ms、`Ready` 时取 80/120 ms；10k 档首批 0.65 ms p50 / 0.91 ms p95（`bench_search --query the`，50 条命中），加 80 ms 防抖仍 ≤81 ms，满足 ≤100 ms |
 | REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | **通过 2026-10-23**：基线入库；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 自检均通过；基准不进 CI |
@@ -247,4 +249,4 @@ pub fn search_cancel(request_id: u64);
 - 架构视图：C2（容器依赖）、C3（新增 Snapshot/Watcher/Channel 组件）
 - 实现落点：`src-tauri/src/search.rs`、`src-tauri/src/watcher.rs`、`src-tauri/src/notes.rs`、`src-tauri/src/bin/bench_search.rs`、`src/adapters/tauri/noteRepository.ts`、`src/application/{ports,workspace}.ts`、`src/ui/{App,Sidebar}.tsx`
 - 文档：`README.md`、`knowledge.md`
-- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁）、REQ-026（流式契约与取消，Task 5）、REQ-029 的 80/120/200 ms 防抖，均已推送至 `origin/main` 并通过 CI（web / Rust / docs 三 job）。REQ-027（notify 监听与失效，Task 6）已实现并通过 49 个 Rust 用例：外部编辑 300–400 ms 可见，监听失败转 `Degraded` 后按 mtime+size 校验。待实现 REQ-028（50k 上限与侧栏虚拟化，Task 7——虚拟化按项目所有者要求暂缓）。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。
+- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁）、REQ-026（流式契约与取消，Task 5）、REQ-029 的 80/120/200 ms 防抖，均已推送至 `origin/main` 并通过 CI（web / Rust / docs 三 job）。REQ-027（notify 监听与失效，Task 6）已实现并通过 50 个 Rust 用例：外部编辑 300–400 ms 可见，监听失败转 `Degraded` 后按 mtime+size 校验（10k 档降级查询 p50 183 ms），同一事件流以 `workspace:changed` 增量更新侧栏文件树。待实现 REQ-028（50k 上限与侧栏虚拟化，Task 7——虚拟化按项目所有者要求暂缓）。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。

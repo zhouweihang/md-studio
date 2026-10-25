@@ -1,4 +1,4 @@
-import type { DeletedNote, NoteDocument, NoteEntry } from '../core/notes'
+import type { DeletedNote, NoteDocument, NoteEntry, WorkspaceDelta } from '../core/notes'
 import type { SearchHit, SearchSummary, SnapshotStatus } from '../core/search'
 import type { NoteRepository } from './ports'
 
@@ -52,5 +52,9 @@ export class WorkspaceService {
 
   snapshotStatus(): Promise<SnapshotStatus | null> {
     return this.repository.snapshotStatus()
+  }
+
+  onWorkspaceChanged(handler: (delta: WorkspaceDelta) => void): Promise<() => void> {
+    return this.repository.onWorkspaceChanged(handler)
   }
 }

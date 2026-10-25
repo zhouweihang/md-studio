@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::notes::{canonical_root, is_ignored_segment, is_markdown};
+use crate::notes::{WorkspaceDelta, canonical_root, is_ignored_segment, is_markdown};
 use crate::search::{self, ReloadOutcome};
 
 /// Quiet period before a batch of filesystem events is applied. Long enough to
@@ -18,14 +18,35 @@ pub const DEBOUNCE: Duration = Duration::from_millis(300);
 /// `Degraded` and queries start revalidating by mtime+size (ADR-009).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Callback the watcher uses to push note-list changes to the UI.
+pub type WorkspaceEmitter = Arc<dyn Fn(WorkspaceDelta) + Send + Sync>;
+
+/// Event name the frontend subscribes to (see `noteRepository.ts`).
+pub const WORKSPACE_EVENT: &str = "workspace:changed";
+
 struct WatchHandle {
     root: PathBuf,
+    /// Shared with the debounce thread so a later `watch_workspace` call for the
+    /// same root can attach the UI emitter to the running thread.
+    emitter: Arc<Mutex<Option<WorkspaceEmitter>>>,
     /// Dropping the notify watcher stops its backend thread, which drops the
     /// event sender and ends the debounce thread.
     _watcher: RecommendedWatcher,
 }
 
 static WATCHER: OnceLock<Mutex<Option<WatchHandle>>> = OnceLock::new();
+/// Installed by `run()` once Tauri is up; keeps this module free of Tauri types
+/// so the library can still be tested without a WebView2 runtime.
+static EMITTER: OnceLock<WorkspaceEmitter> = OnceLock::new();
+
+pub fn set_emitter(emitter: WorkspaceEmitter) {
+    let _ = EMITTER.set(emitter);
+}
+
+/// The emitter installed by the app, if any.
+pub fn global_emitter() -> Option<WorkspaceEmitter> {
+    EMITTER.get().cloned()
+}
 
 fn watcher_slot() -> &'static Mutex<Option<WatchHandle>> {
     WATCHER.get_or_init(|| Mutex::new(None))
@@ -34,15 +55,19 @@ fn watcher_slot() -> &'static Mutex<Option<WatchHandle>> {
 /// Starts the recursive watcher for `root`, reusing it when the workspace has
 /// not changed. Watching is best-effort: the caller turns an error into a
 /// `Degraded` snapshot instead of failing the workspace open (ADR-009).
-pub fn watch_workspace(root: &Path) -> Result<(), String> {
+pub fn watch_workspace(root: &Path, emitter: Option<WorkspaceEmitter>) -> Result<(), String> {
     // The snapshot is keyed by the canonical root, so events must be resolved
     // against the same path.
     let root = canonical_root(&root.to_string_lossy())?;
     {
-        let slot = watcher_slot()
+        let mut slot = watcher_slot()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot.as_ref().is_some_and(|handle| handle.root == root) {
+        if let Some(handle) = slot.as_mut().filter(|handle| handle.root == root) {
+            *handle
+                .emitter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = emitter;
             return Ok(());
         }
     }
@@ -60,9 +85,11 @@ pub fn watch_workspace(root: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot watch workspace: {error}"))?;
 
     let watch_root = root.clone();
+    let emitter_slot = Arc::new(Mutex::new(emitter));
+    let thread_slot = Arc::clone(&emitter_slot);
     std::thread::Builder::new()
         .name("search-watch".to_string())
-        .spawn(move || debounce_loop(watch_root, receiver))
+        .spawn(move || debounce_loop(watch_root, receiver, thread_slot))
         .map_err(|error| format!("cannot start file watcher thread: {error}"))?;
 
     let mut slot = watcher_slot()
@@ -70,6 +97,7 @@ pub fn watch_workspace(root: &Path) -> Result<(), String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(WatchHandle {
         root,
+        emitter: emitter_slot,
         _watcher: watcher,
     });
     Ok(())
@@ -104,7 +132,11 @@ fn is_relevant(event: &Event) -> bool {
 
 /// Coalesces events until the workspace has been quiet for `DEBOUNCE`, then
 /// applies them. Exits when the watcher (and therefore the sender) is dropped.
-fn debounce_loop(root: PathBuf, receiver: Receiver<notify::Result<Event>>) {
+fn debounce_loop(
+    root: PathBuf,
+    receiver: Receiver<notify::Result<Event>>,
+    emitter: Arc<Mutex<Option<WorkspaceEmitter>>>,
+) {
     let mut pending: BTreeSet<PathBuf> = BTreeSet::new();
     let mut deadline: Option<Instant> = None;
 
@@ -130,8 +162,18 @@ fn debounce_loop(root: PathBuf, receiver: Receiver<notify::Result<Event>>) {
                 if deadline.is_none() {
                     continue;
                 }
-                flush(&root, std::mem::take(&mut pending));
+                let delta = flush(&root, std::mem::take(&mut pending));
                 deadline = None;
+
+                if !delta.is_empty() {
+                    let emitter = emitter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(emitter) = emitter {
+                        emitter(delta);
+                    }
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -141,7 +183,8 @@ fn debounce_loop(root: PathBuf, receiver: Receiver<notify::Result<Event>>) {
 /// Reduces every event to "what is on disk now": a path that still exists is
 /// re-read into the snapshot, a path that is gone is dropped. That single rule
 /// covers create, modify, remove, in-place saves and atomic temp-file renames.
-fn flush(root: &Path, paths: BTreeSet<PathBuf>) {
+fn flush(root: &Path, paths: BTreeSet<PathBuf>) -> WorkspaceDelta {
+    let mut delta = WorkspaceDelta::default();
     let mut failures = 0u32;
 
     for path in paths {
@@ -154,8 +197,16 @@ fn flush(root: &Path, paths: BTreeSet<PathBuf>) {
 
         if is_markdown(&path) {
             match search::cache_reload(root, &relative) {
+                ReloadOutcome::Inserted(entry) => {
+                    delta.added.push(entry);
+                    failures = 0;
+                }
+                ReloadOutcome::Removed => {
+                    delta.removed.push(relative);
+                    failures = 0;
+                }
                 ReloadOutcome::Failed => failures += 1,
-                _ => failures = 0,
+                ReloadOutcome::Updated | ReloadOutcome::Unchanged => failures = 0,
             }
             continue;
         }
@@ -163,7 +214,9 @@ fn flush(root: &Path, paths: BTreeSet<PathBuf>) {
         // A removed folder takes its notes with it; a created one needs nothing
         // because its files produce their own events.
         if !path.exists() {
-            search::cache_remove_subtree(root, &relative);
+            delta
+                .removed
+                .extend(search::cache_remove_subtree(root, &relative));
         }
     }
 
@@ -173,6 +226,8 @@ fn flush(root: &Path, paths: BTreeSet<PathBuf>) {
             "workspace notes could not be read after external changes",
         );
     }
+
+    delta
 }
 
 fn relative_to(root: &Path, path: &Path) -> Option<String> {
@@ -243,7 +298,7 @@ mod tests {
 
     fn open(root: &Path) -> WatchGuard {
         search::warm_snapshot_blocking(&root.to_string_lossy()).unwrap();
-        watch_workspace(root).unwrap();
+        watch_workspace(root, None).unwrap();
         WatchGuard
     }
 
@@ -389,7 +444,7 @@ mod tests {
         assert!(is_watching(first.path()));
 
         search::warm_snapshot_blocking(&second.path().to_string_lossy()).unwrap();
-        watch_workspace(second.path()).unwrap();
+        watch_workspace(second.path(), None).unwrap();
         assert!(is_watching(second.path()));
         assert!(!is_watching(first.path()));
 
@@ -397,5 +452,53 @@ mod tests {
         wait_until(Duration::from_secs(3), || {
             search(second.path(), "rebound").len() == 1
         });
+    }
+
+    #[test]
+    fn tree_delta_reports_creates_and_renames_but_not_edits() {
+        let _guard = search::test_guard();
+        let temp = tempdir().unwrap();
+        let root_buf = canonical(temp.path());
+        let root: &Path = &root_buf;
+        write_file(root, "keep.md", "needle\n");
+        search::warm_snapshot_blocking(&root.to_string_lossy()).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let emitter: WorkspaceEmitter = Arc::new(move |delta: WorkspaceDelta| {
+            let _ = sender.send(delta);
+        });
+        watch_workspace(root, Some(emitter)).unwrap();
+        let _watch = WatchGuard;
+
+        // Editing a listed note changes its body, not the tree.
+        fs::write(root.join("keep.md"), "needle again\n").unwrap();
+        let edit = receiver.recv_timeout(DEBOUNCE + Duration::from_millis(300));
+        assert!(
+            edit.is_err(),
+            "an in-place edit should not emit a tree delta: {edit:?}"
+        );
+
+        write_file(root, "fresh.md", "new body\n");
+        let delta = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(delta.added.len(), 1, "{delta:?}");
+        assert_eq!(delta.added[0].path, "fresh.md");
+        assert_eq!(delta.added[0].name, "fresh.md");
+        assert_eq!(delta.added[0].title, "fresh");
+        assert!(delta.added[0].modified_ms.is_some());
+        assert!(delta.removed.is_empty());
+
+        // A rename arrives as a removal of the old path plus an addition.
+        fs::rename(root.join("fresh.md"), root.join("renamed.md")).unwrap();
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        wait_until(Duration::from_secs(3), || {
+            while let Ok(delta) = receiver.try_recv() {
+                added.extend(delta.added.into_iter().map(|entry| entry.path));
+                removed.extend(delta.removed);
+            }
+            added.iter().any(|path| path == "renamed.md")
+                && removed.iter().any(|path| path == "fresh.md")
+        });
+        assert!(!added.iter().any(|path| path == "keep.md"));
     }
 }

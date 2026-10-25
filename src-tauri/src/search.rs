@@ -875,9 +875,11 @@ impl SnapshotInner {
         self.evict_to_budget();
     }
 
-    fn remove_path(&mut self, path: &str) {
+    /// Returns whether the path was present, so callers can tell a real removal
+    /// from a stale event about a path that was never listed.
+    fn remove_path(&mut self, path: &str) -> bool {
         let Some(position) = self.index.remove(path) else {
-            return;
+            return false;
         };
 
         self.drop_text(position);
@@ -886,6 +888,7 @@ impl SnapshotInner {
             self.index
                 .insert(self.notes[offset].path.to_string(), offset);
         }
+        true
     }
 
     /// Reconciles the note list with a fresh `list_notes` result. Existing
@@ -1231,15 +1234,36 @@ pub(crate) fn cache_rename(root: &Path, from: &str, to: &str) {
     inner.insert_note(to.clone(), title_for(&to), text, stamp);
 }
 
-/// Result of mirroring one externally changed path into the snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of mirroring one externally changed path into the snapshot. The
+/// variants that change the note list carry what the UI needs to patch its tree
+/// without re-listing the whole workspace (ADR-009).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReloadOutcome {
-    /// The new body is cached.
+    /// The path appeared in the workspace; this entry should be inserted.
+    Inserted(NoteEntry),
+    /// An existing entry got a new body or timestamp.
     Updated,
-    /// The path no longer exists, so the entry was dropped.
+    /// The path no longer exists and the entry was dropped.
     Removed,
-    /// The path exists but could not be read or is not cacheable.
+    /// The event did not concern a listed note (temp files, unknown paths).
+    Unchanged,
+    /// The path exists but its body could not be read; any cached body is gone.
     Failed,
+}
+
+/// Builds the tree-facing entry for a snapshot key.
+fn entry_for_key(key: &str, modified_ms: u64) -> NoteEntry {
+    let name = key.rsplit('/').next().unwrap_or(key).to_string();
+    NoteEntry {
+        path: key.to_string(),
+        name,
+        title: title_for(key),
+        modified_ms: if modified_ms == 0 {
+            None
+        } else {
+            Some(modified_ms)
+        },
+    }
 }
 
 /// Re-reads one note and mirrors it into the snapshot. This is the watcher's
@@ -1248,17 +1272,20 @@ pub(crate) enum ReloadOutcome {
 /// temporary file and a rename.
 pub(crate) fn cache_reload(root: &Path, relative: &str) -> ReloadOutcome {
     let Some(snapshot) = active_snapshot(root) else {
-        return ReloadOutcome::Removed;
+        return ReloadOutcome::Unchanged;
     };
     let Some(key) = cache_key(relative) else {
-        return ReloadOutcome::Removed;
+        return ReloadOutcome::Unchanged;
     };
 
     let (target, metadata) = match resolve_search_target_with_metadata(root, &key) {
         Ok(found) => found,
         Err(_) => {
-            snapshot.lock().remove_path(&key);
-            return ReloadOutcome::Removed;
+            return if snapshot.lock().remove_path(&key) {
+                ReloadOutcome::Removed
+            } else {
+                ReloadOutcome::Unchanged
+            };
         }
     };
     let stamp = modified_ms(&metadata).unwrap_or(0);
@@ -1271,40 +1298,40 @@ pub(crate) fn cache_reload(root: &Path, relative: &str) -> ReloadOutcome {
         None
     };
 
-    let updated = text.is_some();
+    let entry = entry_for_key(&key, stamp);
+    let title = entry.title.clone();
     let mut inner = snapshot.lock();
-    let title = title_for(&key);
-    match text {
-        Some(text) => match inner.index.get(&key).copied() {
-            Some(index) => {
-                inner.notes[index].title = Arc::from(title.as_str());
-                inner.cache_text(&key, Arc::from(text), stamp);
-            }
-            None => inner.insert_note(key, title, Some(Arc::from(text)), stamp),
-        },
-        None => match inner.index.get(&key).copied() {
-            Some(index) => {
-                inner.notes[index].modified_ms = stamp;
-                inner.drop_text(index);
-            }
-            None => inner.insert_note(key, title, None, stamp),
-        },
-    }
-
-    if updated {
-        ReloadOutcome::Updated
-    } else {
-        ReloadOutcome::Failed
+    let existing = inner.index.get(&key).copied();
+    match (&text, existing) {
+        (Some(text), Some(index)) => {
+            inner.notes[index].title = Arc::from(title.as_str());
+            inner.cache_text(&key, Arc::from(text.as_str()), stamp);
+            ReloadOutcome::Updated
+        }
+        (Some(text), None) => {
+            inner.insert_note(key, title, Some(Arc::from(text.as_str())), stamp);
+            ReloadOutcome::Inserted(entry)
+        }
+        (None, Some(index)) => {
+            inner.notes[index].modified_ms = stamp;
+            inner.drop_text(index);
+            ReloadOutcome::Failed
+        }
+        (None, None) => {
+            inner.insert_note(key, title, None, stamp);
+            ReloadOutcome::Inserted(entry)
+        }
     }
 }
 
-/// Drops every note under a removed directory.
-pub(crate) fn cache_remove_subtree(root: &Path, relative: &str) {
+/// Drops every note under a removed directory and returns the dropped paths so
+/// the tree can drop them too.
+pub(crate) fn cache_remove_subtree(root: &Path, relative: &str) -> Vec<String> {
     let Some(snapshot) = active_snapshot(root) else {
-        return;
+        return Vec::new();
     };
     let Some(key) = normalized_relative(relative) else {
-        return;
+        return Vec::new();
     };
 
     let prefix = format!("{key}/");
@@ -1316,9 +1343,18 @@ pub(crate) fn cache_remove_subtree(root: &Path, relative: &str) {
         .map(|note| note.path.to_string())
         .collect();
 
-    for path in victims {
-        inner.remove_path(&path);
+    for path in &victims {
+        inner.remove_path(path);
     }
+    victims
+}
+
+/// Public form of `mark_degraded` for callers holding a user-supplied root
+/// (the benchmark measures the degradation path this way).
+pub fn degrade_snapshot(root: &str, reason: &str) -> Result<(), String> {
+    let root = canonical_root(root)?;
+    mark_degraded(&root, reason);
+    Ok(())
 }
 
 /// Marks the snapshot as serving possibly stale bodies (ADR-009). Queries keep
@@ -1357,18 +1393,7 @@ fn validate_degraded(snapshot: &Arc<Snapshot>) {
         return;
     }
 
-    let mut stale = Vec::new();
-    for (path, size, stamp) in candidates {
-        let Ok((_, metadata)) = resolve_search_target_with_metadata(&root, &path) else {
-            stale.push(path);
-            continue;
-        };
-        let same_size = metadata.len() == size as u64;
-        let same_stamp = stamp == 0 || modified_ms(&metadata).unwrap_or(0) == stamp;
-        if !(same_size && same_stamp) {
-            stale.push(path);
-        }
-    }
+    let stale = stale_bodies(&root, &candidates);
     if stale.is_empty() {
         return;
     }
@@ -1387,6 +1412,51 @@ fn validate_degraded(snapshot: &Arc<Snapshot>) {
     }
 
     spawn_warm(Arc::clone(snapshot));
+}
+
+/// Stats every cached body and returns the paths whose size or mtime changed.
+/// Parallel because 10k serial `stat` calls cost ~690 ms on Windows (measured),
+/// which would erase the cache's advantage in the very mode that needs it.
+fn stale_bodies(root: &Path, candidates: &[(String, usize, u64)]) -> Vec<String> {
+    fn check(root: &Path, slice: &[(String, usize, u64)]) -> Vec<String> {
+        let mut stale = Vec::new();
+        for (path, size, stamp) in slice {
+            let fresh = match resolve_search_target_with_metadata(root, path) {
+                Ok((_, metadata)) => {
+                    metadata.len() == *size as u64
+                        && (*stamp == 0 || modified_ms(&metadata).unwrap_or(0) == *stamp)
+                }
+                Err(_) => false,
+            };
+            if !fresh {
+                stale.push(path.clone());
+            }
+        }
+        stale
+    }
+
+    if candidates.len() < 2 {
+        return check(root, candidates);
+    }
+
+    let workers = worker_count(MAX_SNAPSHOT_THREADS).min(candidates.len());
+    let chunk_size = candidates.len().div_ceil(workers);
+    let mut stale = Vec::new();
+
+    thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || check(root, chunk)))
+            .collect();
+
+        for handle in handles {
+            if let Ok(mut local) = handle.join() {
+                stale.append(&mut local);
+            }
+        }
+    });
+
+    stale
 }
 
 #[cfg(test)]

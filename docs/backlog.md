@@ -20,7 +20,7 @@
 | ~~B1-1~~ | 删除/重命名笔记 | RFC-002 §4.1/§4.2；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：工具栏对话框 + Rust `delete_note`/`rename_note`，路径校验与冲突拒绝有单测 | 侧栏提供删除/重命名，二次确认，Rust 侧同样做路径校验 + 单测 |
 | ~~B1-2~~ | 全文搜索 | RFC-002 §4.3；ADR-004；`search_notes` | **Completed 2026-10-23**：Rust 行扫描，250ms 防抖，返回行号/片段；上限 50 条 | 输入 300ms 内返回命中片段；>5000 文件时用派生索引，需新 ADR |
 | ~~B1-7~~ | 删除进系统回收站 | RFC-004 §4.1；ADR-006；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：`trash` crate 移入系统回收站；删除返回文本快照，toast「撤销」写回原路径；回收站失败保持文件；Rust 6 个用例 + 前端 2 个用例 | 使用平台回收站 API + 撤销入口；单测覆盖失败路径 |
-| B1-3 | 文件系统监听 | ADR-003 Decision 2；ADR-009 | **部分完成 2026-10-25**：监听已上线并服务搜索快照失效（见 B4 组的文件监听条目，已完成）；文件树增量更新尚未接入（现在仍靠 `list_notes` 刷新） | 监听工作区变化并增量更新树；重命名/原子保存不丢事件 |
+| ~~B1-3~~ | 文件系统监听 | ADR-003 Decision 2；ADR-009 | **Completed 2026-10-25**：监听服务搜索快照失效（见 B4 组的文件监听条目）与文件树；新增/删除/改名以 `workspace:changed` 增量推送，前端 `applyWorkspaceDelta` 就地 patch，正文修改不发事件（不干扰自动保存）；Rust 50 passed、前端 61 passed | 监听工作区变化并增量更新树；重命名/原子保存不丢事件 |
 | ~~B1-4~~ | 并发编辑冲突检测 | RFC-003 §4.1；ADR-005；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：FNV-1a revision 条件写入，冲突返回 `conflict:` 且不覆盖；UI 提供重新载入/覆盖保存；Rust 3 个用例 + 前端 3 个用例 | 保存前比较内容哈希，冲突时提示选择保留版本；补 Rust 集成测试 |
 | ~~B1-5~~ | 未保存关闭确认 | RFC-003 §4.4；`src/ui/App.tsx` | **Completed 2026-10-23**：`onCloseRequested` 先 flush 再 `close()`，失败/冲突保持窗口；前端 close 用例覆盖 | 监听 close-requested，dirty 时 flush 或弹确认 |
 | B1-6 | 多标签/多窗口 | RFC-001 §7 非目标 | 未实现；单笔记会话 | 有明确用户需求后开新 RFC，评估状态模型与内存占用 |

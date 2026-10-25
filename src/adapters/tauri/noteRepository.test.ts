@@ -13,10 +13,11 @@ const mocks = vi.hoisted(() => {
     }
   }
 
-  return { invoke: vi.fn(), Channel }
+  return { invoke: vi.fn(), Channel, listen: vi.fn() }
 })
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, Channel: mocks.Channel }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 
 const first: SearchHit = {
   path: 'a.md',
@@ -33,6 +34,7 @@ const second: SearchHit = {
 
 beforeEach(() => {
   mocks.invoke.mockReset()
+  mocks.listen.mockReset()
   mocks.Channel.instances.length = 0
 })
 
@@ -83,6 +85,31 @@ describe('TauriNoteRepository', () => {
     await repository.cancelSearch(41)
 
     expect(mocks.invoke).toHaveBeenCalledWith('search_cancel', { requestId: 41 })
+  })
+
+  it('subscribes to workspace deltas and hands back the unlisten function', async () => {
+    const handlers: Array<(event: { payload: unknown }) => void> = []
+    const stop = vi.fn()
+    mocks.listen.mockImplementation(
+      async (event: string, next: (event: { payload: unknown }) => void) => {
+        expect(event).toBe('workspace:changed')
+        handlers.push(next)
+        return stop
+      },
+    )
+
+    const seen: unknown[] = []
+    const repository = new TauriNoteRepository()
+    const unlisten = await repository.onWorkspaceChanged((delta) => seen.push(delta))
+
+    const delta = {
+      added: [{ path: 'new.md', name: 'new.md', title: 'new', modifiedMs: 7 }],
+      removed: ['old.md'],
+    }
+    handlers[0]({ payload: delta })
+
+    expect(seen).toEqual([delta])
+    expect(unlisten).toBe(stop)
   })
 
   it('passes the snapshot status through, including the empty case', async () => {

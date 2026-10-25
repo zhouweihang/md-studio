@@ -4,7 +4,7 @@ import { WorkspaceService } from '../application/workspace'
 import { TauriNoteRepository } from '../adapters/tauri/noteRepository'
 import { pickWorkspace } from '../adapters/tauri/picker'
 import { DebouncedSaver } from '../core/autosave'
-import type { DeletedNote, NoteEntry } from '../core/notes'
+import { applyWorkspaceDelta, type DeletedNote, type NoteEntry } from '../core/notes'
 import { mergeHits, searchDebounceMs } from '../core/search'
 import type { SearchHit, SearchSummary, SnapshotStatus } from '../core/search'
 import { EditorPane } from './EditorPane'
@@ -221,6 +221,34 @@ export function App() {
     return () => {
       cancelled = true
       if (timer) clearTimeout(timer)
+    }
+  }, [root])
+
+  // The Rust watcher coalesces filesystem events into note-list deltas, so
+  // external creates, renames and deletes reach the tree without a refresh
+  // (ADR-009). In-place edits do not emit a delta, so autosave costs nothing.
+  useEffect(() => {
+    if (!root) return
+
+    let disposed = false
+    let unlisten: (() => void) | null = null
+
+    service
+      .onWorkspaceChanged((delta) => {
+        if (disposed) return
+        setNotes((current) => applyWorkspaceDelta(current, delta))
+      })
+      .then((stop) => {
+        if (disposed) stop()
+        else unlisten = stop
+      })
+      .catch(() => {
+        // Deltas only save work; the refresh button still reconciles fully.
+      })
+
+    return () => {
+      disposed = true
+      unlisten?.()
     }
   }, [root])
 

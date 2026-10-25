@@ -12,6 +12,45 @@ export interface NoteDocument {
   revision: string
 }
 
+/** Incremental note-list change pushed by the Rust watcher (ADR-009). */
+export interface WorkspaceDelta {
+  /** Notes that appeared (created or renamed into the workspace). */
+  added: NoteEntry[]
+  /** Relative paths that no longer exist. */
+  removed: string[]
+}
+
+/**
+ * Applies a watcher delta to the note list. A path that is both removed and
+ * added in one batch ends up present: the watcher emits both sides of an atomic
+ * replace, and the file exists afterwards.
+ */
+export function applyWorkspaceDelta(
+  notes: readonly NoteEntry[],
+  delta: WorkspaceDelta,
+): NoteEntry[] {
+  if (delta.added.length === 0 && delta.removed.length === 0) return [...notes]
+
+  const removed = new Set(delta.removed)
+  const pending = new Map(delta.added.map((note) => [note.path, note]))
+
+  const next: NoteEntry[] = []
+  for (const note of notes) {
+    if (removed.has(note.path)) continue
+
+    const replacement = pending.get(note.path)
+    if (replacement) {
+      pending.delete(note.path)
+      next.push(replacement)
+      continue
+    }
+    next.push(note)
+  }
+
+  next.push(...pending.values())
+  return next
+}
+
 export interface DeletedNote {
   /** Relative path the note can be restored to. */
   path: string

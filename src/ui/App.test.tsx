@@ -21,9 +21,22 @@ const mocks = vi.hoisted(() => {
     }
   }
 
+  const workspaceListeners: Array<(event: { payload: unknown }) => void> = []
+  const listen = vi.fn(
+    async (_event: string, handler: (event: { payload: unknown }) => void) => {
+      workspaceListeners.push(handler)
+      return () => {
+        const index = workspaceListeners.indexOf(handler)
+        if (index >= 0) workspaceListeners.splice(index, 1)
+      }
+    },
+  )
+
   return {
     invoke: vi.fn(),
     Channel,
+    listen,
+    workspaceListeners,
     open: vi.fn(),
     openUrl: vi.fn(),
     closeListeners,
@@ -41,6 +54,7 @@ const mocks = vi.hoisted(() => {
 })
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, Channel: mocks.Channel }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: mocks.open }))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: mocks.openUrl }))
 vi.mock('@tauri-apps/api/window', () => ({
@@ -85,6 +99,8 @@ beforeEach(() => {
   mocks.close.mockClear()
   mocks.onCloseRequested.mockClear()
   mocks.closeListeners.length = 0
+  mocks.workspaceListeners.length = 0
+  mocks.listen.mockClear()
   mocks.Channel.instances.length = 0
 
   mocks.open.mockResolvedValue('C:\\notes')
@@ -187,6 +203,32 @@ describe('App', () => {
 
     expect(await screen.findByText(/搜索缓存 · 64 B/)).toBeTruthy()
     expect(screen.getByText('2/2 篇')).toBeTruthy()
+  })
+
+  it('patches the tree from watcher deltas without re-listing the workspace', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: '打开 Markdown 文件夹' }))
+    await screen.findByText('hello.md')
+    await waitFor(() => expect(mocks.workspaceListeners).toHaveLength(1))
+
+    const listings = () =>
+      mocks.invoke.mock.calls.filter(([command]) => command === 'list_notes').length
+    const before = listings()
+
+    act(() => {
+      mocks.workspaceListeners[0]({
+        payload: {
+          added: [{ path: 'drafts/idea.md', name: 'idea.md', title: 'idea', modifiedMs: 9 }],
+          removed: ['ideas/architecture.md'],
+        },
+      })
+    })
+
+    expect(await screen.findByText('idea.md')).toBeTruthy()
+    expect(screen.queryByText('architecture.md')).toBeNull()
+    expect(listings()).toBe(before)
   })
 
   it('creates a note from the sidebar and opens it', async () => {
