@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use aho_corasick::AhoCorasick;
 use serde::Serialize;
@@ -24,6 +26,8 @@ pub const MAX_SEARCH_THREADS: usize = 8;
 /// and scheduling overhead take over (measured on 32 logical cores: 8 threads
 /// 24 ms p50, 16 threads 17 ms p50, 32 threads no better and a worse tail).
 pub const MAX_SNAPSHOT_THREADS: usize = 16;
+/// Hits per streamed batch (RFC-006 §4.5 / ADR-008).
+pub const SEARCH_BATCH_SIZE: usize = 16;
 /// Default budget for cached note bodies. RFC-006 §4.4: the snapshot is a
 /// read-only cache, so memory is capped and overflow only costs speed.
 pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
@@ -41,6 +45,57 @@ pub struct SearchHit {
     pub line: u32,
     /// Context around the match, truncated by characters.
     pub preview: String,
+}
+
+/// Where the scanned bodies came from, so the UI can show whether a query was
+/// served from the warm snapshot or fell back to the disk (RFC-006 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchSource {
+    /// Every body came from the in-memory snapshot.
+    Snapshot,
+    /// Every body was read from disk (no warm snapshot for this root).
+    Disk,
+    /// Some bodies came from the snapshot and some from disk (evicted, not yet
+    /// warmed, oversized, non-UTF-8).
+    Mixed,
+}
+
+/// Events streamed to the frontend over a Tauri channel (ADR-008). `Done` is
+/// sent exactly once per request and never after a cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SearchEvent {
+    Batch {
+        hits: Vec<SearchHit>,
+    },
+    Done {
+        total: u32,
+        truncated: bool,
+        #[serde(rename = "tookMs")]
+        took_ms: u32,
+        source: SearchSource,
+    },
+}
+
+/// Newest request id started by the frontend. A worker whose id is older is
+/// stale and exits at its next batch boundary.
+static ACTIVE_REQUEST: AtomicU64 = AtomicU64::new(0);
+/// Newest cancelled request id. Ids are monotonic, so `<=` cancels the target
+/// and every older request while leaving newer requests untouched.
+static CANCELLED_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+pub fn begin_request(request_id: u64) {
+    ACTIVE_REQUEST.fetch_max(request_id, Ordering::SeqCst);
+}
+
+pub fn cancel_request(request_id: u64) {
+    CANCELLED_REQUEST.fetch_max(request_id, Ordering::SeqCst);
+}
+
+fn request_is_cancelled(request_id: u64) -> bool {
+    request_id < ACTIVE_REQUEST.load(Ordering::SeqCst)
+        || request_id <= CANCELLED_REQUEST.load(Ordering::SeqCst)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,7 +130,8 @@ struct ScanItem {
 /// in-memory snapshot, the cold path walks the workspace. Both call the same
 /// scanner, so an entry that is missing from the cache (evicted, not yet
 /// warmed, oversized, non-UTF-8) simply falls back to disk without changing
-/// results or order.
+/// results or order. This is the collecting form used by tests and the
+/// benchmark; the app itself streams through `search_stream_blocking`.
 pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, String> {
     let needle = query.trim();
     if needle.is_empty() {
@@ -84,23 +140,98 @@ pub fn search_notes_blocking(root: &str, query: &str) -> Result<Vec<SearchHit>, 
 
     let matcher = Matcher::new(needle);
     let root_path = canonical_root(root)?;
+    let (items, source) = scan_items_for(&root_path)?;
 
-    if let Some(snapshot) = active_snapshot(&root_path) {
-        if let Some(items) = snapshot.ready_items() {
-            return parallel_scan(
-                &matcher,
-                &root_path,
-                &items,
-                MAX_SEARCH_HITS,
-                MAX_SNAPSHOT_THREADS,
-            );
-        }
-    }
-
-    search_disk_blocking(&matcher, &root_path)
+    parallel_scan(
+        &matcher,
+        &root_path,
+        &items,
+        MAX_SEARCH_HITS,
+        scan_threads(source),
+    )
 }
 
-/// Cold path: enumerate the workspace and scan straight from disk.
+/// Streams the same hits as `search_notes_blocking`: batches of at most
+/// `SEARCH_BATCH_SIZE`, then one `Done` carrying the total, truncation flag,
+/// elapsed time and data source (RFC-006 §4.5). `emit` returns `false` when the
+/// receiver is gone (window closed or cancelled), which stops the scan without
+/// sending `Done` and without failing the command.
+pub fn search_stream_blocking(
+    root: &str,
+    query: &str,
+    request_id: u64,
+    emit: &mut dyn FnMut(SearchEvent) -> bool,
+) -> Result<(), String> {
+    begin_request(request_id);
+    let started = Instant::now();
+    let root_path = canonical_root(root)?;
+    let needle = query.trim();
+
+    if needle.is_empty() {
+        let source = if active_snapshot(&root_path).is_some() {
+            SearchSource::Snapshot
+        } else {
+            SearchSource::Disk
+        };
+        let _ = emit(SearchEvent::Done {
+            total: 0,
+            truncated: false,
+            took_ms: 0,
+            source,
+        });
+        return Ok(());
+    }
+
+    let matcher = Matcher::new(needle);
+    let (items, hint) = scan_items_for(&root_path)?;
+    let outcome = parallel_scan_stream(
+        &matcher,
+        &root_path,
+        &items,
+        MAX_SEARCH_HITS,
+        scan_threads(hint),
+        Some(request_id),
+        emit,
+    )?;
+
+    if outcome.stopped {
+        // Cancelled, superseded or the receiver went away: no `Done`.
+        return Ok(());
+    }
+
+    let took_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+    let _ = emit(SearchEvent::Done {
+        total: outcome.hits as u32,
+        truncated: outcome.hits >= MAX_SEARCH_HITS,
+        took_ms,
+        source: resolve_source(hint, outcome.cached_bodies, outcome.disk_bodies),
+    });
+
+    Ok(())
+}
+
+/// Snapshot items when the warm cache is ready, otherwise a disk-backed list.
+fn scan_items_for(root: &Path) -> Result<(Vec<ScanItem>, SearchSource), String> {
+    if let Some(items) = active_snapshot(root).and_then(|snapshot| snapshot.ready_items()) {
+        return Ok((items, SearchSource::Snapshot));
+    }
+
+    let notes = list_note_entries_at(root)?;
+    let items = notes
+        .iter()
+        .map(|note| ScanItem {
+            path: Arc::from(note.path.as_str()),
+            title: Arc::from(note.title.as_str()),
+            text: None,
+        })
+        .collect();
+
+    Ok((items, SearchSource::Disk))
+}
+
+/// Disk-only scan used by tests that need a baseline independent of whatever
+/// snapshot happens to be installed.
+#[cfg(test)]
 fn search_disk_blocking(matcher: &Matcher, root: &Path) -> Result<Vec<SearchHit>, String> {
     let notes = list_note_entries_at(root)?;
     let items: Vec<ScanItem> = notes
@@ -115,10 +246,24 @@ fn search_disk_blocking(matcher: &Matcher, root: &Path) -> Result<Vec<SearchHit>
     parallel_scan(matcher, root, &items, MAX_SEARCH_HITS, MAX_SEARCH_THREADS)
 }
 
-/// Splits the path-sorted item list into contiguous ranges and scans them in
-/// parallel. Chunks are joined in order, so this reproduces the serial hit
-/// order and the global cap only ever drops the tail. Each chunk keeps at most
-/// the global cap of its own hits, which is all a truncated prefix can consume.
+fn scan_threads(source: SearchSource) -> usize {
+    match source {
+        SearchSource::Snapshot => MAX_SNAPSHOT_THREADS,
+        _ => MAX_SEARCH_THREADS,
+    }
+}
+
+fn resolve_source(hint: SearchSource, cached: usize, disk: usize) -> SearchSource {
+    match (cached, disk) {
+        (0, 0) => hint,
+        (_, 0) => SearchSource::Snapshot,
+        (0, _) => SearchSource::Disk,
+        _ => SearchSource::Mixed,
+    }
+}
+
+/// Collecting wrapper over `parallel_scan_stream`, used by tests and the
+/// benchmark. Membership cannot be cancelled here, so no request id is passed.
 fn parallel_scan(
     matcher: &Matcher,
     root: &Path,
@@ -126,52 +271,175 @@ fn parallel_scan(
     limit: usize,
     max_threads: usize,
 ) -> Result<Vec<SearchHit>, String> {
+    let mut collected = Vec::new();
+    {
+        let mut emit = |event: SearchEvent| {
+            if let SearchEvent::Batch { hits } = event {
+                collected.extend(hits);
+            }
+            true
+        };
+        parallel_scan_stream(matcher, root, items, limit, max_threads, None, &mut emit)?;
+    }
+    Ok(collected)
+}
+
+/// One result range plus where its bodies came from.
+struct ScanOutcome {
+    hits: Vec<SearchHit>,
+    cached_bodies: usize,
+    disk_bodies: usize,
+}
+
+struct StreamOutcome {
+    hits: usize,
+    cached_bodies: usize,
+    disk_bodies: usize,
+    /// The scan stopped early: cancelled, superseded, or the receiver is gone.
+    stopped: bool,
+}
+
+/// Batch buffer for one streamed search. Hits are grouped as the chunks are
+/// joined in path order, so batches keep the same order a serial scan would
+/// produce and the global cap only ever drops the tail.
+struct StreamState {
+    request_id: Option<u64>,
+    hits: usize,
+    cached_bodies: usize,
+    disk_bodies: usize,
+    pending: Vec<SearchHit>,
+    stopped: bool,
+}
+
+impl StreamState {
+    fn new(request_id: Option<u64>) -> Self {
+        Self {
+            request_id,
+            hits: 0,
+            cached_bodies: 0,
+            disk_bodies: 0,
+            pending: Vec::with_capacity(SEARCH_BATCH_SIZE),
+            stopped: false,
+        }
+    }
+
+    fn absorb(&mut self, outcome: ScanOutcome, limit: usize) {
+        self.cached_bodies += outcome.cached_bodies;
+        self.disk_bodies += outcome.disk_bodies;
+
+        let take = outcome.hits.len().min(limit.saturating_sub(self.hits));
+        self.hits += take;
+        self.pending.extend(outcome.hits.into_iter().take(take));
+    }
+
+    /// Sends every full batch plus the remainder. Checking the request here is
+    /// what makes cancellation take effect at batch boundaries.
+    fn flush(&mut self, emit: &mut dyn FnMut(SearchEvent) -> bool) {
+        while self.pending.len() >= SEARCH_BATCH_SIZE {
+            if !self.send(SEARCH_BATCH_SIZE, emit) {
+                return;
+            }
+        }
+        if !self.pending.is_empty() {
+            let remainder = self.pending.len();
+            self.send(remainder, emit);
+        }
+    }
+
+    fn send(&mut self, len: usize, emit: &mut dyn FnMut(SearchEvent) -> bool) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self.request_id.is_some_and(request_is_cancelled) {
+            self.stopped = true;
+            return false;
+        }
+
+        let batch: Vec<SearchHit> = self.pending.drain(..len).collect();
+        if !emit(SearchEvent::Batch { hits: batch }) {
+            self.stopped = true;
+            return false;
+        }
+        true
+    }
+
+    fn finish(self) -> StreamOutcome {
+        StreamOutcome {
+            hits: self.hits,
+            cached_bodies: self.cached_bodies,
+            disk_bodies: self.disk_bodies,
+            stopped: self.stopped,
+        }
+    }
+}
+
+/// Splits the path-sorted item list into contiguous ranges, scans them in
+/// parallel and emits batches as each range joins in order. Chunks are joined
+/// in list order, so this reproduces the serial hit order and the global cap
+/// only ever drops the tail.
+fn parallel_scan_stream(
+    matcher: &Matcher,
+    root: &Path,
+    items: &[ScanItem],
+    limit: usize,
+    max_threads: usize,
+    request_id: Option<u64>,
+    emit: &mut dyn FnMut(SearchEvent) -> bool,
+) -> Result<StreamOutcome, String> {
+    let mut state = StreamState::new(request_id);
+
     if items.len() < 2 {
-        return Ok(scan_items(matcher, root, items, limit));
+        state.absorb(scan_items(matcher, root, items, limit), limit);
+        state.flush(emit);
+        return Ok(state.finish());
     }
 
     let workers = worker_count(max_threads).min(items.len());
     let chunk_size = items.len().div_ceil(workers);
-    let mut chunk_hits: Vec<Vec<SearchHit>> = Vec::with_capacity(workers);
     let mut panicked = false;
 
     thread::scope(|scope| {
-        let matcher = matcher;
         let handles: Vec<_> = items
             .chunks(chunk_size)
             .map(|chunk| scope.spawn(move || scan_items(matcher, root, chunk, limit)))
             .collect();
 
         for handle in handles {
+            if state.stopped {
+                break;
+            }
+            if state.request_id.is_some_and(request_is_cancelled) {
+                state.stopped = true;
+                break;
+            }
             match handle.join() {
-                Ok(hits) => chunk_hits.push(hits),
-                Err(_) => panicked = true,
+                Ok(outcome) => {
+                    state.absorb(outcome, limit);
+                    state.flush(emit);
+                }
+                Err(_) => {
+                    panicked = true;
+                    break;
+                }
             }
         }
     });
 
     if panicked {
-        // A partially scanned workspace must never be returned as a complete
+        // A partially scanned workspace must never be reported as a complete
         // result, so a worker panic fails the whole search.
         return Err("search worker thread panicked".to_string());
     }
 
-    let mut hits = Vec::with_capacity(limit);
-    for chunk in chunk_hits {
-        let remaining = limit.saturating_sub(hits.len());
-        if remaining == 0 {
-            break;
-        }
-        hits.extend(chunk.into_iter().take(remaining));
-    }
-
-    Ok(hits)
+    Ok(state.finish())
 }
 
 /// One contiguous range of the path-sorted item list. Stops at `limit` hits or
 /// when the range is exhausted, exactly like a serial scan would.
-fn scan_items(matcher: &Matcher, root: &Path, items: &[ScanItem], limit: usize) -> Vec<SearchHit> {
+fn scan_items(matcher: &Matcher, root: &Path, items: &[ScanItem], limit: usize) -> ScanOutcome {
     let mut hits = Vec::new();
+    let mut cached_bodies = 0usize;
+    let mut disk_bodies = 0usize;
 
     for item in items {
         if hits.len() >= limit {
@@ -180,7 +448,10 @@ fn scan_items(matcher: &Matcher, root: &Path, items: &[ScanItem], limit: usize) 
 
         let cached;
         let text: &str = match &item.text {
-            Some(text) => text,
+            Some(text) => {
+                cached_bodies += 1;
+                text
+            }
             None => {
                 let target = match resolve_search_target(root, &item.path) {
                     Ok(path) => path,
@@ -189,6 +460,7 @@ fn scan_items(matcher: &Matcher, root: &Path, items: &[ScanItem], limit: usize) 
                 match fs::read_to_string(&target) {
                     Ok(text) => {
                         cached = text;
+                        disk_bodies += 1;
                         &cached
                     }
                     Err(_) => continue,
@@ -199,7 +471,11 @@ fn scan_items(matcher: &Matcher, root: &Path, items: &[ScanItem], limit: usize) 
         collect_note_hits(matcher, &item.path, &item.title, text, &mut hits, limit);
     }
 
-    hits
+    ScanOutcome {
+        hits,
+        cached_bodies,
+        disk_bodies,
+    }
 }
 
 fn collect_note_hits(
@@ -1118,7 +1394,7 @@ mod tests {
 
         for query in ["needle", "rare token"] {
             let matcher = Matcher::new(query);
-            let serial = scan_items(&matcher, &root_path, &items, MAX_SEARCH_HITS);
+            let serial = scan_items(&matcher, &root_path, &items, MAX_SEARCH_HITS).hits;
             let parallel = search_notes_blocking(&root_string, query).unwrap();
 
             assert_eq!(
@@ -1478,5 +1754,238 @@ mod tests {
         let hits = search_notes_blocking(&root_string, "fresh").unwrap();
         assert_eq!(hits.len(), 1, "snapshot should mirror the write");
         assert_eq!(hits[0].path, "note.md");
+    }
+
+    /// Request ids are global and monotonic, so tests that run in any order
+    /// must never reuse one: a stale id is cancelled by design.
+    fn next_request_id() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1_000);
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Six notes with five matching lines each: 18 hits, because the per-note
+    /// cap stops at three. That is more than one batch but well under the
+    /// global cap of 50.
+    fn streaming_workspace(root: &Path) {
+        for index in 0..6 {
+            let mut body = format!("# Note {index}\n\n");
+            for line in 0..5 {
+                body.push_str(&format!("needle on line {line}\n"));
+            }
+            write_file(root, &format!("note-{index}.md"), &body);
+        }
+    }
+
+    fn batch_sizes(events: &[SearchEvent]) -> Vec<usize> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SearchEvent::Batch { hits } => Some(hits.len()),
+                SearchEvent::Done { .. } => None,
+            })
+            .collect()
+    }
+
+    fn streamed_hits(events: &[SearchEvent]) -> Vec<SearchHit> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SearchEvent::Batch { hits } => Some(hits.clone()),
+                SearchEvent::Done { .. } => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn stream_sends_capped_batches_then_one_done() {
+        let _guard = test_guard();
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        streaming_workspace(root);
+        let root_string = root.to_string_lossy().into_owned();
+
+        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut emit = |event: SearchEvent| {
+            events.push(event);
+            true
+        };
+        search_stream_blocking(&root_string, "needle", next_request_id(), &mut emit).unwrap();
+
+        let sizes = batch_sizes(&events);
+        assert!(
+            sizes.iter().all(|size| *size <= SEARCH_BATCH_SIZE),
+            "batch exceeded the cap: {sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), 18);
+        assert_eq!(
+            streamed_hits(&events),
+            search_notes_blocking(&root_string, "needle").unwrap()
+        );
+
+        match events.last() {
+            Some(SearchEvent::Done {
+                total,
+                truncated,
+                source,
+                ..
+            }) => {
+                assert_eq!(*total, 18);
+                assert!(!*truncated, "18 hits are below the global cap");
+                assert_eq!(*source, SearchSource::Disk, "no snapshot was warmed");
+            }
+            other => panic!("last event should be Done, got {other:?}"),
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SearchEvent::Done { .. }))
+                .count(),
+            1,
+            "Done must be sent exactly once"
+        );
+    }
+
+    #[test]
+    fn stream_reports_truncation_when_the_global_cap_is_hit() {
+        let _guard = test_guard();
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..30 {
+            let mut body = format!("# Note {index}\n\n");
+            for line in 0..5 {
+                body.push_str(&format!("needle on line {line}\n"));
+            }
+            write_file(root, &format!("note-{index:02}.md"), &body);
+        }
+        let root_string = root.to_string_lossy().into_owned();
+
+        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut emit = |event: SearchEvent| {
+            events.push(event);
+            true
+        };
+        search_stream_blocking(&root_string, "needle", next_request_id(), &mut emit).unwrap();
+
+        assert_eq!(streamed_hits(&events).len(), MAX_SEARCH_HITS);
+        match events.last() {
+            Some(SearchEvent::Done {
+                total, truncated, ..
+            }) => {
+                assert_eq!(*total, MAX_SEARCH_HITS as u32);
+                assert!(*truncated, "hitting the cap must set truncated");
+            }
+            other => panic!("last event should be Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_stops_without_done_when_cancelled_mid_scan() {
+        let _guard = test_guard();
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        streaming_workspace(root);
+        let root_string = root.to_string_lossy().into_owned();
+        let request_id = next_request_id();
+
+        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut emit = |event: SearchEvent| {
+            if matches!(event, SearchEvent::Batch { .. }) {
+                // Simulates the user clearing the query after the first batch.
+                cancel_request(request_id);
+            }
+            events.push(event);
+            true
+        };
+        search_stream_blocking(&root_string, "needle", request_id, &mut emit).unwrap();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "cancellation must stop the scan: {events:?}"
+        );
+        assert!(
+            matches!(events[0], SearchEvent::Batch { .. }),
+            "no Done may follow a cancelled request"
+        );
+    }
+
+    #[test]
+    fn stream_reports_snapshot_source_when_the_cache_is_ready() {
+        let _guard = test_guard();
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        streaming_workspace(root);
+        let root_string = root.to_string_lossy().into_owned();
+        let status = warm_snapshot_blocking(&root_string).unwrap();
+        assert_eq!(status.state, SnapshotState::Ready);
+        assert_eq!(status.cached, 6);
+
+        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut emit = |event: SearchEvent| {
+            events.push(event);
+            true
+        };
+        search_stream_blocking(&root_string, "needle", next_request_id(), &mut emit).unwrap();
+
+        match events.last() {
+            Some(SearchEvent::Done { source, total, .. }) => {
+                assert_eq!(*total, 18);
+                assert_eq!(*source, SearchSource::Snapshot);
+            }
+            other => panic!("last event should be Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_events_match_the_frontend_contract() {
+        let batch = serde_json::to_value(SearchEvent::Batch {
+            hits: vec![SearchHit {
+                path: "a.md".to_string(),
+                title: "a".to_string(),
+                line: 3,
+                preview: "needle".to_string(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(batch["kind"], "batch");
+        assert_eq!(batch["hits"][0]["line"], 3);
+
+        let done = serde_json::to_value(SearchEvent::Done {
+            total: 2,
+            truncated: false,
+            took_ms: 7,
+            source: SearchSource::Snapshot,
+        })
+        .unwrap();
+        assert_eq!(done["kind"], "done");
+        assert_eq!(done["tookMs"], 7);
+        assert_eq!(done["source"], "snapshot");
+        assert_eq!(done["truncated"], false);
+    }
+
+    #[test]
+    fn stream_delivers_an_empty_done_for_a_blank_query() {
+        let _guard = test_guard();
+        let temp = tempdir().unwrap();
+        let root_string = temp.path().to_string_lossy().into_owned();
+
+        let mut events: Vec<SearchEvent> = Vec::new();
+        let mut emit = |event: SearchEvent| {
+            events.push(event);
+            true
+        };
+        search_stream_blocking(&root_string, "   ", next_request_id(), &mut emit).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SearchEvent::Done {
+                total, truncated, ..
+            } => {
+                assert_eq!(*total, 0);
+                assert!(!*truncated);
+            }
+            other => panic!("blank query should emit only Done, got {other:?}"),
+        }
     }
 }

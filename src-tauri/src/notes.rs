@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::fs;
 
-use crate::search::SearchHit;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -560,11 +559,29 @@ pub fn rename_note(root: String, path: String, new_title: String) -> AppResult<N
     Ok(entry)
 }
 
+/// Streams hits over `on_event` (ADR-008). The scan runs on a blocking thread,
+/// and `Done` is sent before this returns, so the caller can await the promise
+/// and still have seen every event.
 #[tauri::command]
-pub async fn search_notes(root: String, query: String) -> AppResult<Vec<SearchHit>> {
-    tauri::async_runtime::spawn_blocking(move || crate::search::search_notes_blocking(&root, &query))
-        .await
-        .map_err(|error| format!("search task failed: {error}"))?
+pub async fn search_notes(
+    root: String,
+    query: String,
+    request_id: u64,
+    on_event: tauri::ipc::Channel<crate::search::SearchEvent>,
+) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut emit = |event: crate::search::SearchEvent| on_event.send(event).is_ok();
+        crate::search::search_stream_blocking(&root, &query, request_id, &mut emit)
+    })
+    .await
+    .map_err(|error| format!("search task failed: {error}"))?
+}
+
+/// Cancels a streamed search. Batches already in flight may still arrive; the
+/// frontend drops them by request id (ADR-008).
+#[tauri::command]
+pub fn search_cancel(request_id: u64) {
+    crate::search::cancel_request(request_id);
 }
 
 #[cfg(test)]
@@ -582,6 +599,9 @@ mod tests {
 
     #[test]
     fn list_notes_returns_nested_markdown_and_skips_hidden() {
+        // `list_notes` installs a search snapshot in a process-global slot, so
+        // this test must not overlap other tests that do the same.
+        let _guard = crate::search::test_guard();
         let temp = tempdir().unwrap();
         let root = temp.path();
         write_file(root, "alpha.md", "a");
@@ -601,6 +621,7 @@ mod tests {
 
     #[test]
     fn list_notes_sorts_case_insensitively() {
+        let _guard = crate::search::test_guard();
         let temp = tempdir().unwrap();
         let root = temp.path();
         write_file(root, "Banana.md", "b");

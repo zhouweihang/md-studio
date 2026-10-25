@@ -19,9 +19,12 @@ function repository(): NoteRepository {
     deleteNote: vi.fn(async () => ({ path: note.path, content: '# hello' })),
     restoreNote: vi.fn(async () => note),
     renameNote: vi.fn(async () => note),
-    searchNotes: vi.fn(async () => [
-      { path: 'hello.md', title: 'hello', line: 1, preview: '# hello' },
-    ]),
+    searchNotes: vi.fn(async (_root, _query, _requestId, onBatch) => {
+      onBatch([{ path: 'hello.md', title: 'hello', line: 1, preview: '# hello' }])
+      return { total: 1, truncated: false, tookMs: 3, source: 'snapshot' as const }
+    }),
+    cancelSearch: vi.fn(async () => {}),
+    snapshotStatus: vi.fn(async () => null),
   }
 }
 
@@ -43,7 +46,18 @@ describe('WorkspaceService', () => {
     })
     expect(await service.restore('/notes', 'hello.md', '# hello')).toEqual(note)
     expect(await service.rename('/notes', 'hello.md', 'renamed')).toEqual(note)
-    expect(await service.search('/notes', 'hello')).toHaveLength(1)
+
+    const batch = vi.fn()
+    expect(await service.search('/notes', 'hello', 7, batch)).toEqual({
+      total: 1,
+      truncated: false,
+      tookMs: 3,
+      source: 'snapshot',
+    })
+    expect(batch).toHaveBeenCalledWith([
+      { path: 'hello.md', title: 'hello', line: 1, preview: '# hello' },
+    ])
+    expect(await service.snapshotStatus()).toBeNull()
 
     expect(port.listNotes).toHaveBeenCalledWith('/notes')
     expect(port.readNote).toHaveBeenCalledWith('/notes', 'hello.md')
@@ -52,7 +66,7 @@ describe('WorkspaceService', () => {
     expect(port.deleteNote).toHaveBeenCalledWith('/notes', 'hello.md')
     expect(port.restoreNote).toHaveBeenCalledWith('/notes', 'hello.md', '# hello')
     expect(port.renameNote).toHaveBeenCalledWith('/notes', 'hello.md', 'renamed')
-    expect(port.searchNotes).toHaveBeenCalledWith('/notes', 'hello')
+    expect(port.searchNotes).toHaveBeenCalledWith('/notes', 'hello', 7, batch)
   })
 
   it('propagates repository errors unchanged', async () => {

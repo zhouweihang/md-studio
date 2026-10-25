@@ -14,6 +14,8 @@
 
 2026-10-24：L2 落地（REQ-024 / REQ-025）。暖 p50 1k 4.1 ms、10k 19.8 ms、50k 2,509.8 ms，比 L1 分别下降 95.1% / 97.5% / 41.9%（50k 受 256 MB 预算限制，仅 11,520 / 50,000 篇入缓存）；10k p95 28.4 ms。
 
+2026-10-25：REQ-026 / REQ-029 落地（plan Task 5）。`search_notes(root, query, request_id, on_event)` 改为 Channel 流式，新增 `search_cancel`，旧的一次性返回退役；前端端口改为 `searchNotes(root, query, requestId, onBatch)`。10k 档首批结果 0.65 ms（p50）/ 0.91 ms（p95，常见词 50 条），峰值扫描 14.3 ms。
+
 2026-10-25：**修订 REQ-024 的 SLO 口径**。原目标「10k 档暖查询 p95 ≤20 ms」与语料体积不自洽——10k 语料正文 215.6 MiB，20 ms 意味着 10.8 GB/s 且不留任何调度与合并开销，而实测整篇扫描 p50 18–20 ms 已是 11–12 GB/s。改为按正文字节表达：p95 ≤ 20 ms + 0.10 ms/MiB 已缓存正文（固定开销 ≤20 ms + 带宽 ≥10 GB/s），10k 预算 41.6 ms、实测 28.4 ms。REQ-026~029（流式、监听、50k 上限与虚拟化）仍未实现。
 
 ## 1. 需求
@@ -154,7 +156,9 @@ pub fn search_cancel(request_id: u64);
 - `request_id` 单调递增；Rust 保存最新值，工作线程每批检查一次，过期立即退出。
 - `search_cancel` 用于清空查询与切换工作区；取消不保证「零批次」，前端按 `request_id` 丢弃迟到事件。
 - 每批最多 16 条；`Done` 只发一次，包含总数、是否截断、耗时与数据来源。
-- 前端端口改为 `searchNotes(root, query, onBatch): Promise<SearchSummary>`；适配器负责 `new Channel<SearchEvent>()`。
+- 前端端口改为 `searchNotes(root, query, requestId, onBatch): Promise<SearchSummary>`；适配器负责 `new Channel<SearchEvent>()`。
+
+实现（2026-10-25）：`SearchEvent` 用 `#[serde(tag = "kind")]` 序列化为 `{ kind: "batch" | "done", … }`，`source` 三态为 `snapshot` / `disk` / `mixed`，按实际读到正文的篇数统计（全是缓存 / 全是磁盘 / 混合）。命令在 `spawn_blocking` 里跑扫描，`Done` 在命令返回前发出，所以前端 `await` 结束后事件已全部到齐。取消用两个全局原子：`begin_request` 记录最新 id，`cancel_request` 记录最近取消的 id，工作线程在每批发送前与每次 join 前各检查一次，`id < ACTIVE || id <= CANCELLED` 即视为过期；取消与接收端消失（窗口关闭）都不发 `Done`、不报错。分块仍按路径顺序 join，因此批次内的顺序与串行扫描一致；单批不足 16 条时在块结束时先发一次，保证首屏不用等最后一个块。
 
 ### 4.6 监听与失效（REQ-027）
 
@@ -215,10 +219,10 @@ pub fn search_cancel(request_id: u64);
 | REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | **通过 2026-10-24**：1k 暖 p50 83.7 ms / p95 93.3 ms，10k 793.8 ms，50k 4,322.1 ms（L0 为 290.3 / 2,880.8 / 14,881.8）；跨块顺序由块序拼接 + 主线程截断保证，`parallel_scan_matches_serial_scan_hit_for_hit` 逐条比对；Rust 27 passed |
 | REQ-024 | 全缓存时暖查询 p95 ≤ 20 ms + 0.10 ms/MiB 已缓存正文；LRU 单测 | **通过 2026-10-25（SLO 同日修订，见 §1 注）**：暖 p50 1k 4.1 / 10k 19.8 / 50k 2,509.8 ms（L1 为 83.7 / 793.8 / 4,322.1），p95 15.3 / 28.4 / 2,657.1 ms。对 1k（27.3 MiB）预算 22.7 ms、10k（215.6 MiB）预算 41.6 ms，两档余量均约 32%，说明「固定项 + 线性项」模型与实测吻合。LRU 预算/淘汰/记账单测覆盖，零缓存与部分缓存结果逐条等于实时扫描。50k 因 256 MB 预算只缓存 11,520 / 50,000 篇，属部分缓存，按「结果与实时扫描逐条一致 + 记录 cached/total」验收，不套用该 SLO |
 | REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | **通过 2026-10-24**：`list_notes` 返回后后台预热（1k 225 ms / 10k 2.21 s / 50k 8.25 s），UI 不等待；`snapshot_status` 返回 `Warming/Ready/Degraded` 与 total/cached/bytes/budget；预算耗尽记 `Ready` 且部分命中，全部读失败记 `Degraded`，未就绪或降级时全程回退实时扫描 |
-| REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | 待实现（plan Task 5） |
+| REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | **通过 2026-10-25**：`search_stream_blocking` 以批次 ≤16 发送、`Done` 唯一（单测断言事件数与末事件）；取消后不再发 `Done`、不报错，前端按 `requestId` 丢弃迟到批次（App 测试）；旧的一次性 `invoke('search_notes')` 签名已无调用方，`SearchHit[]` 不再穿过命令边界；Rust 42 passed、前端 47 passed |
 | REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | 待实现（plan Task 6） |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |
-| REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | 待实现（plan Task 5） |
+| REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | **通过 2026-10-25**：`searchDebounceMs` 覆盖 80/120/200 三档（单测），App 在 `Warming`/无快照时取 200 ms、`Ready` 时取 80/120 ms；10k 档首批 0.65 ms p50 / 0.91 ms p95（`bench_search --query the`，50 条命中），加 80 ms 防抖仍 ≤81 ms，满足 ≤100 ms |
 | REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | **通过 2026-10-23**：基线入库；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 自检均通过；基准不进 CI |
 
 验收前必须跑：`bun run test`、`bun run typecheck`、`bun run build`、`cargo test --locked --all-targets`、`bun run tauri build`、`node scripts/check-eng-docs.cjs`。性能数字一律以 release 为准，并记录机器档位（spec §10.3）。
@@ -241,4 +245,4 @@ pub fn search_cancel(request_id: u64);
 - 架构视图：C2（容器依赖）、C3（新增 Snapshot/Watcher/Channel 组件）
 - 实现落点：`src-tauri/src/search.rs`、`src-tauri/src/watcher.rs`、`src-tauri/src/notes.rs`、`src-tauri/src/bin/bench_search.rs`、`src/adapters/tauri/noteRepository.ts`、`src/application/{ports,workspace}.ts`、`src/ui/{App,Sidebar}.tsx`
 - 文档：`README.md`、`knowledge.md`
-- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁），均已推送至 `origin/main` 并通过 CI（web / Rust 36 passed / docs 三 job）。待实现 REQ-026（流式契约，plan Task 5）、REQ-027（监听，Task 6）、REQ-028/029（50k 上限与防抖，Task 7——侧栏虚拟化按项目所有者要求暂缓）。已知缺口：ADR-009 监听落地前，外部编辑器修改不会被快照感知，仅应用内写入自动镜像。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。
+- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁），均已推送至 `origin/main` 并通过 CI（web / Rust 36 passed / docs 三 job）。已上线 REQ-026（流式契约与取消，plan Task 5）与 REQ-029 的 80/120/200 ms 防抖。待实现 REQ-027（监听，Task 6）、REQ-028（50k 上限与侧栏虚拟化，Task 7——虚拟化按项目所有者要求暂缓）。已知缺口：ADR-009 监听落地前，外部编辑器修改不会被快照感知，仅应用内写入自动镜像。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。

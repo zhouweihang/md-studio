@@ -15,6 +15,7 @@ pub fn run() {
             notes::restore_note,
             notes::rename_note,
             notes::search_notes,
+            notes::search_cancel,
             notes::snapshot_status
         ])
         .run(tauri::generate_context!())

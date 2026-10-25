@@ -1,8 +1,61 @@
 use std::env;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use md_studio_lib::search::{search_notes_blocking, warm_snapshot_blocking};
+use md_studio_lib::search::{
+    SearchEvent, SearchSource, search_notes_blocking, search_stream_blocking,
+    warm_snapshot_blocking,
+};
+
+/// Streamed requests need a fresh, monotonic id because the backend cancels
+/// anything older than the newest one (ADR-008).
+static REQUEST: AtomicU64 = AtomicU64::new(1);
+
+struct StreamTiming {
+    first_batch: Duration,
+    done: Duration,
+    hits: usize,
+    source: SearchSource,
+}
+
+/// Runs one search through the shipped streaming path and records when the
+/// first batch reached the `Channel` sink, which is what the UI paints first.
+fn stream_once(root: &str, query: &str) -> Result<StreamTiming, String> {
+    let request_id = REQUEST.fetch_add(1, Ordering::SeqCst);
+    let started = Instant::now();
+    let mut first_batch: Option<Duration> = None;
+    let mut hits = 0usize;
+    let mut source = SearchSource::Disk;
+
+    let mut emit = |event: SearchEvent| {
+        match event {
+            SearchEvent::Batch { hits: batch } => {
+                if first_batch.is_none() {
+                    first_batch = Some(started.elapsed());
+                }
+                hits += batch.len();
+            }
+            SearchEvent::Done {
+                total, source: done_source, ..
+            } => {
+                hits = total as usize;
+                source = done_source;
+            }
+        }
+        true
+    };
+
+    search_stream_blocking(root, query, request_id, &mut emit)?;
+
+    let done = started.elapsed();
+    Ok(StreamTiming {
+        first_batch: first_batch.unwrap_or(done),
+        done,
+        hits,
+        source,
+    })
+}
 
 struct Args {
     root: String,
@@ -114,22 +167,29 @@ fn run() -> Result<(), String> {
     }
 
     for _ in 0..args.warmup {
-        search_notes_blocking(&args.root, &args.query)?;
+        stream_once(&args.root, &args.query)?;
     }
 
     let mut samples = Vec::with_capacity(args.repeat);
+    let mut first_samples = Vec::with_capacity(args.repeat);
     let mut hits = cold_hits.len();
+    let mut reported_source = SearchSource::Disk;
     for _ in 0..args.repeat {
-        let started = Instant::now();
-        hits = search_notes_blocking(&args.root, &args.query)?.len();
-        samples.push(started.elapsed());
+        let timing = stream_once(&args.root, &args.query)?;
+        hits = timing.hits;
+        reported_source = timing.source;
+        samples.push(timing.done);
+        first_samples.push(timing.first_batch);
     }
     samples.sort();
+    first_samples.sort();
 
     let p50 = percentile(&samples, 0.50);
     let p95 = percentile(&samples, 0.95);
     let min = samples.first().copied().unwrap_or_default();
     let max = samples.last().copied().unwrap_or_default();
+    let first_p50 = percentile(&first_samples, 0.50);
+    let first_p95 = percentile(&first_samples, 0.95);
 
     if args.json {
         let payload = serde_json::json!({
@@ -143,8 +203,14 @@ fn run() -> Result<(), String> {
             "warmP95Ms": ms(p95),
             "warmMinMs": ms(min),
             "warmMaxMs": ms(max),
+            "firstBatchP50Ms": ms(first_p50),
+            "firstBatchP95Ms": ms(first_p95),
             "warmUpMs": warm_up,
-            "source": if args.snapshot { "snapshot" } else { "disk" },
+            "source": match reported_source {
+                SearchSource::Snapshot => "snapshot",
+                SearchSource::Disk => "disk",
+                SearchSource::Mixed => "mixed",
+            },
             "cache": cache,
             "peakRssMb": serde_json::Value::Null
         });
@@ -162,6 +228,11 @@ fn run() -> Result<(), String> {
             println!("cache:  {cache}");
         }
         println!("warm:   p50 {:.2} ms / p95 {:.2} ms", ms(p50), ms(p95));
+        println!(
+            "first:  batch p50 {:.2} ms / p95 {:.2} ms",
+            ms(first_p50),
+            ms(first_p95)
+        );
         println!(
             "range:  {:.2} – {:.2} ms over {} runs ({} warmup)",
             ms(min),

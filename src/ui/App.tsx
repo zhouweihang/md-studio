@@ -5,7 +5,8 @@ import { TauriNoteRepository } from '../adapters/tauri/noteRepository'
 import { pickWorkspace } from '../adapters/tauri/picker'
 import { DebouncedSaver } from '../core/autosave'
 import type { DeletedNote, NoteEntry } from '../core/notes'
-import type { SearchHit } from '../core/search'
+import { mergeHits, searchDebounceMs } from '../core/search'
+import type { SearchHit, SearchSummary, SnapshotStatus } from '../core/search'
 import { EditorPane } from './EditorPane'
 import { NoteDialog, type NoteDialogMode } from './NoteDialog'
 import { PreviewPane } from './PreviewPane'
@@ -104,6 +105,7 @@ export function App() {
   const [query, setQuery] = useState('')
   const [contentHits, setContentHits] = useState<SearchHit[]>([])
   const [searching, setSearching] = useState(false)
+  const [searchSummary, setSearchSummary] = useState<SearchSummary | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('split')
   const [loading, setLoading] = useState(false)
   const [saveState, setSaveState] = useState<SaveState>('idle')
@@ -115,6 +117,11 @@ export function App() {
   const saverRef = useRef<DebouncedSaver | null>(null)
   const revisionRef = useRef<string | null>(null)
   const closingRef = useRef(false)
+  /** Monotonic search id: the backend cancels anything older (ADR-008). */
+  const requestIdRef = useRef(0)
+  const snapshotRef = useRef<SnapshotStatus | null>(null)
+  const noteCountRef = useRef(0)
+  noteCountRef.current = notes.length
 
   const dirty = opened ? opened.content !== opened.savedContent : false
   const conflict = saveState === 'conflict'
@@ -171,6 +178,15 @@ export function App() {
     }
   }, [])
 
+  const refreshSnapshotStatus = useCallback(async () => {
+    try {
+      snapshotRef.current = await service.snapshotStatus()
+    } catch {
+      // Only a debounce hint; a missing snapshot must never surface as an error.
+      snapshotRef.current = null
+    }
+  }, [])
+
   const loadWorkspace = useCallback(async (path: string) => {
     setLoading(true)
     try {
@@ -180,8 +196,10 @@ export function App() {
       revisionRef.current = null
       setRoot(path)
       setNotes(entries)
+      void refreshSnapshotStatus()
       setOpened(null)
       setContentHits([])
+      setSearchSummary(null)
       setQuery('')
       setUndo(null)
       setSaveState('idle')
@@ -190,7 +208,7 @@ export function App() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [refreshSnapshotStatus])
 
   useEffect(() => {
     const stored = readStoredWorkspace()
@@ -263,35 +281,46 @@ export function App() {
   useEffect(() => {
     const term = query.trim()
     if (!root || !term) {
+      if (requestIdRef.current > 0) void service.cancelSearch(requestIdRef.current)
       setContentHits([])
+      setSearchSummary(null)
       setSearching(false)
       return
     }
 
+    // Every keystroke supersedes the previous request: the backend drops stale
+    // work and the id guards against batches that arrive late (ADR-008).
+    const requestId = requestIdRef.current + 1
+    requestIdRef.current = requestId
     let cancelled = false
+
     setContentHits([])
+    setSearchSummary(null)
     setSearching(true)
 
     const timer = setTimeout(() => {
       void service
-        .search(root, term)
-        .then((hits) => {
-          if (!cancelled) setContentHits(hits)
+        .search(root, term, requestId, (batch) => {
+          if (cancelled) return
+          setContentHits((current) => mergeHits(current, batch))
+        })
+        .then((summary) => {
+          if (cancelled) return
+          setSearchSummary(summary)
+          setSearching(false)
         })
         .catch((caught: unknown) => {
-          if (!cancelled) {
-            setContentHits([])
-            setError(friendlyError(caught))
-          }
+          if (cancelled) return
+          setContentHits([])
+          setSearching(false)
+          setError(friendlyError(caught))
         })
-        .finally(() => {
-          if (!cancelled) setSearching(false)
-        })
-    }, 250)
+    }, searchDebounceMs(noteCountRef.current, snapshotRef.current?.state ?? null))
 
     return () => {
       cancelled = true
       clearTimeout(timer)
+      void service.cancelSearch(requestId)
     }
   }, [query, root])
 
@@ -312,13 +341,14 @@ export function App() {
     setLoading(true)
     try {
       setNotes(await service.list(root))
+      void refreshSnapshotStatus()
       setError(null)
     } catch (caught) {
       setError(friendlyError(caught))
     } finally {
       setLoading(false)
     }
-  }, [root])
+  }, [refreshSnapshotStatus, root])
 
   const openNote = useCallback(
     async (note: NoteEntry, focusLine?: number) => {
@@ -573,6 +603,7 @@ export function App() {
           loading={loading}
           contentHits={contentHits}
           searching={searching}
+          summary={searchSummary}
           onQueryChange={setQuery}
           onOpenWorkspace={() => void handleOpenWorkspace()}
           onRefresh={() => void handleRefresh()}

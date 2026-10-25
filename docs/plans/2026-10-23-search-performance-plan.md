@@ -6,7 +6,7 @@
 
 **Goal:** 把搜索从「每次查询重扫磁盘」重构为「后台预热的内存快照 + 并行扫描 + Channel 流式返回」，10k 档暖查询 p95 ≤ 41.6 ms（= 20 ms 固定开销 + 0.10 ms/MiB × 215.6 MiB，2026-10-25 修订），50k 档可打开可搜索，并建立分机器基线的回归门禁。
 
-**Status:** In progress（Task 0–4 完成；下一步 Task 5；Task 7 按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，已回填 RFC-006 §0/§1/§6/§8。
+**Status:** In progress（Task 0–5 完成；下一步 Task 6；Task 7 按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，并完成 Task 5 流式契约，均已回填 RFC-006。
 
 **权威文档：** `docs/rfc/RFC-006-search-performance.md`、`docs/specs/2026-10-23-search-performance-design.md`、ADR-007~009。
 
@@ -119,15 +119,27 @@
 
 **Files:** `src-tauri/src/search.rs`、`src-tauri/src/lib.rs`、`src/application/ports.ts`、`src/application/workspace.ts`、`src/adapters/tauri/noteRepository.ts`、`src/ui/App.tsx`、`src/ui/Sidebar.tsx`、测试文件
 
-- [ ] **Step 1**: 定义 `SearchEvent`、`request_id`、`search_cancel`；旧一次性命令删除。
-- [ ] **Step 2**: 每批 ≤16 条，`Done` 唯一；取消检查每批一次。
-- [ ] **Step 3**: 前端端口与适配器迁移到 `searchNotes(root, query, onBatch)`。
-- [ ] **Step 4**: App effect 管理 requestId、清空旧结果、卸载取消；自适应防抖 80/120/200 ms。
-- [ ] **Step 5**: 每批对 ≤50 条稳定排序；`Done` 显示总数/耗时/来源。
-- [ ] **Step 6**: 测试 mock `Channel`；`noteRepository.test.ts` 断言事件映射；App 测试覆盖流式与取消。
-- [ ] **Step 7**: `bun run typecheck && bun run test`。
+- [x] **Step 1**: 定义 `SearchEvent`（`Batch` / `Done`）、`request_id`、`search_cancel`；旧的一次性返回删除。
+- [x] **Step 2**: 每批 ≤16 条（`SEARCH_BATCH_SIZE`），`Done` 唯一；取消在每批发送前与每次 join 前各检查一次。
+- [x] **Step 3**: 前端端口与适配器迁移到 `searchNotes(root, query, requestId, onBatch)`；适配器创建 `Channel`，`snapshotStatus()` 同步进端口。
+- [x] **Step 4**: App effect 管理 requestId、清空旧结果、卸载/换词时 `search_cancel`；自适应防抖 80/120/200 ms（`searchDebounceMs`）。
+- [x] **Step 5**: 每批用 `mergeHits` 稳定排序去重；`Sidebar` 状态行显示总数/耗时/来源，截断时提示缩小关键词。
+- [x] **Step 6**: 测试 mock `Channel`；`noteRepository.test.ts` 断言事件映射与取消参数；App 测试覆盖流式渲染与取消后丢弃迟到批次。
+- [x] **Step 7**: `bun run typecheck && bun run test` → 47 passed（其中 adapter 4、App 12）。
 
-**验收**：旧命令无引用；取消无迟到副作用；首屏 p95 ≤100 ms（手动计时 @10k）。
+**验收**：旧命令无引用（`SearchHit[]` 不再穿过命令边界）；取消无迟到副作用（App 测试断言批次在取消后不渲染）；首屏 @10k **0.65 ms p50 / 0.91 ms p95**（`bench_search --query the`，50 条命中），加 80 ms 防抖仍远低于 100 ms。
+
+**结果（2026-10-25，release，本机，流式路径）**
+
+| 档位 | 暖 p50 | 暖 p95 | 首批 p50 | 备注 |
+|---|---|---|---|---|
+| 1k | 3.7 ms | 4.7 ms | 4.1 ms | 只有 1 条命中，首批≈全量 |
+| 10k | 14.3 ms | 17.5 ms | 0.65 ms | 首批用常见词「the」（命中上限 50 条） |
+| 50k | 1,999.8 ms | 2,034.8 ms | — | 只缓存 11,520 / 50,000 篇，其余回退读盘 |
+
+- 全量指标比 L2 记录更快（10k p95 28.4 → 17.5 ms），一部分是流式路径提前截断命中上限，一部分是本轮机器负载更轻；已写入 `docs/perf/results/2026-10-25-dev-i9-14900hx.json`，`check:perf` 对旧基线 PASS（比值 0.61–0.90）。
+- 实现备注：取消用两个全局原子（最新 id / 最近取消 id），`id < ACTIVE || id <= CANCELLED` 即过期；接收端消失（窗口关闭）与取消一样不发 `Done`、不报错。分块仍按路径顺序 join，所以批次顺序与串行一致；块结束时先发不足 16 条的余量，避免首屏等最后一块。
+- 测试夹具修正：`notes.rs` 的两个 `list_notes` 用例会安装进程级快照，之前与 `search.rs` 的快照用例并发时会让 `warm_snapshot` 提前退出（`refresh_reconciles_added_and_removed_notes` 偶发失败）；两个用例现与快照用例共用 `test_guard`，连跑三轮全绿。
 
 ## Task 6: 文件监听与失效（REQ-027）
 

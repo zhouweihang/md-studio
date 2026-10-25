@@ -1,5 +1,5 @@
 import type { DeletedNote, NoteDocument, NoteEntry } from '../core/notes'
-import type { SearchHit } from '../core/search'
+import type { SearchHit, SearchSummary, SnapshotStatus } from '../core/search'
 import type { NoteRepository } from './ports'
 
 /**
@@ -37,7 +37,20 @@ export class WorkspaceService {
     return this.repository.renameNote(root, path, newTitle)
   }
 
-  search(root: string, query: string): Promise<SearchHit[]> {
-    return this.repository.searchNotes(root, query)
+  search(
+    root: string,
+    query: string,
+    requestId: number,
+    onBatch: (hits: SearchHit[]) => void,
+  ): Promise<SearchSummary> {
+    return this.repository.searchNotes(root, query, requestId, onBatch)
+  }
+
+  cancelSearch(requestId: number): Promise<void> {
+    return this.repository.cancelSearch(requestId)
+  }
+
+  snapshotStatus(): Promise<SnapshotStatus | null> {
+    return this.repository.snapshotStatus()
   }
 }

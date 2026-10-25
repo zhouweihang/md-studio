@@ -1,13 +1,29 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
 
 const mocks = vi.hoisted(() => {
   const closeListeners: Array<(event: { preventDefault: () => void }) => void> = []
+
+  /** Stand-in for Tauri's `Channel`: the adapter assigns `onmessage`. */
+  class Channel {
+    static instances: Channel[] = []
+    onmessage: ((message: unknown) => void) | null = null
+
+    constructor() {
+      Channel.instances.push(this)
+    }
+
+    send(message: unknown) {
+      this.onmessage?.(message)
+    }
+  }
+
   return {
     invoke: vi.fn(),
+    Channel,
     open: vi.fn(),
     openUrl: vi.fn(),
     closeListeners,
@@ -24,7 +40,7 @@ const mocks = vi.hoisted(() => {
   }
 })
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, Channel: mocks.Channel }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: mocks.open }))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: mocks.openUrl }))
 vi.mock('@tauri-apps/api/window', () => ({
@@ -33,6 +49,19 @@ vi.mock('@tauri-apps/api/window', () => ({
     onCloseRequested: mocks.onCloseRequested,
   }),
 }))
+
+function hit(path: string, line: number, preview: string) {
+  return { path, title: path.replace(/\.md$/, ''), line, preview }
+}
+
+const readySnapshot = {
+  state: 'ready' as const,
+  total: 2,
+  cached: 2,
+  bytes: 64,
+  budgetBytes: 1024,
+  degradedReason: null,
+}
 
 const notes = [
   { path: 'hello.md', name: 'hello.md', title: 'hello', modifiedMs: null },
@@ -56,10 +85,14 @@ beforeEach(() => {
   mocks.close.mockClear()
   mocks.onCloseRequested.mockClear()
   mocks.closeListeners.length = 0
+  mocks.Channel.instances.length = 0
 
   mocks.open.mockResolvedValue('C:\\notes')
   mocks.invoke.mockImplementation((command: string) => {
     if (command === 'list_notes') return Promise.resolve(notes)
+    if (command === 'snapshot_status') return Promise.resolve(readySnapshot)
+    if (command === 'search_cancel') return Promise.resolve()
+    if (command === 'search_notes') return Promise.resolve()
     if (command === 'read_note') {
       return Promise.resolve({ content: '# Hello\n\nworld', revision: 'rev-1' })
     }
@@ -299,23 +332,26 @@ describe('App', () => {
   })
 
   it('highlights the query inside content search hits', async () => {
-    mocks.invoke.mockImplementation((command: string) => {
-      if (command === 'list_notes') return Promise.resolve(notes)
-      if (command === 'read_note') {
-        return Promise.resolve({ content: '# Hello\n\nworld', revision: 'rev-1' })
-      }
-      if (command === 'search_notes') {
-        return Promise.resolve([
-          {
-            path: 'ideas/architecture.md',
-            title: 'architecture',
-            line: 3,
-            preview: 'The autosave loop is subtle.',
-          },
-        ])
-      }
-      return Promise.reject(new Error(`unexpected command: ${command}`))
-    })
+    mocks.invoke.mockImplementation(
+      (command: string, payload?: { onEvent?: { send: (message: unknown) => void } }) => {
+        if (command === 'list_notes') return Promise.resolve(notes)
+        if (command === 'snapshot_status') return Promise.resolve(readySnapshot)
+        if (command === 'search_cancel') return Promise.resolve()
+        if (command === 'read_note') {
+          return Promise.resolve({ content: '# Hello\n\nworld', revision: 'rev-1' })
+        }
+        if (command === 'search_notes') {
+          const channel = payload!.onEvent!
+          channel.send({
+            kind: 'batch',
+            hits: [hit('ideas/architecture.md', 3, 'The autosave loop is subtle.')],
+          })
+          channel.send({ kind: 'done', total: 1, truncated: false, tookMs: 6, source: 'snapshot' })
+          return Promise.resolve()
+        }
+        return Promise.reject(new Error(`unexpected command: ${command}`))
+      },
+    )
 
     const user = userEvent.setup()
     render(<App />)
@@ -329,7 +365,103 @@ describe('App', () => {
     expect(mocks.invoke).toHaveBeenCalledWith('search_notes', {
       root: 'C:\\notes',
       query: 'AutoSave',
+      requestId: expect.any(Number),
+      onEvent: expect.anything(),
     })
+    expect(await screen.findByText(/内容命中 1 条 · 6 ms · 内存快照/)).toBeTruthy()
+  })
+
+  it('renders streamed batches before the scan finishes and reports the summary', async () => {
+    let finish: (() => void) | undefined
+
+    mocks.invoke.mockImplementation(
+      (command: string, payload?: { onEvent?: { send: (message: unknown) => void } }) => {
+        if (command === 'list_notes') return Promise.resolve(notes)
+        if (command === 'snapshot_status') return Promise.resolve(readySnapshot)
+        if (command === 'search_cancel') return Promise.resolve()
+        if (command === 'read_note') {
+          return Promise.resolve({ content: '# Hello\n\nworld', revision: 'rev-1' })
+        }
+        if (command === 'search_notes') {
+          payload!.onEvent!.send({ kind: 'batch', hits: [hit('a.md', 1, 'alpha needle')] })
+          return new Promise<void>((resolve) => {
+            finish = resolve
+          })
+        }
+        return Promise.reject(new Error(`unexpected command: ${command}`))
+      },
+    )
+
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: '打开 Markdown 文件夹' }))
+    await screen.findByText('hello.md')
+    await user.type(screen.getByPlaceholderText('搜索文件名或正文'), 'needle')
+
+    // The first batch is already on screen while the backend keeps scanning.
+    await waitFor(() =>
+      expect(screen.getAllByText('needle', { selector: 'mark' })).toHaveLength(1),
+    )
+    expect(screen.getByText('搜索正文中…')).toBeTruthy()
+
+    const channel = mocks.Channel.instances.at(-1)!
+    await act(async () => {
+      channel.send({ kind: 'batch', hits: [hit('b.md', 2, 'beta needle')] })
+      channel.send({ kind: 'done', total: 2, truncated: false, tookMs: 9, source: 'disk' })
+      finish?.()
+    })
+
+    await waitFor(() =>
+      expect(screen.getAllByText('needle', { selector: 'mark' })).toHaveLength(2),
+    )
+    expect(await screen.findByText(/内容命中 2 条 · 9 ms · 实时扫描/)).toBeTruthy()
+  })
+
+  it('cancels the in-flight search when the query is cleared and drops late batches', async () => {
+    const channels: Array<{ send: (message: unknown) => void }> = []
+    const cancelled: number[] = []
+
+    mocks.invoke.mockImplementation(
+      (
+        command: string,
+        payload?: { requestId?: number; onEvent?: { send: (message: unknown) => void } },
+      ) => {
+        if (command === 'list_notes') return Promise.resolve(notes)
+        if (command === 'snapshot_status') return Promise.resolve(readySnapshot)
+        if (command === 'read_note') return Promise.resolve({ content: '', revision: 'rev-1' })
+        if (command === 'search_notes') {
+          channels.push(payload!.onEvent!)
+          return new Promise(() => {})
+        }
+        if (command === 'search_cancel') {
+          cancelled.push(payload!.requestId!)
+          return Promise.resolve()
+        }
+        return Promise.reject(new Error(`unexpected command: ${command}`))
+      },
+    )
+
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: '打开 Markdown 文件夹' }))
+    await screen.findByText('hello.md')
+    const input = screen.getByPlaceholderText('搜索文件名或正文')
+    await user.type(input, 'needle')
+
+    await waitFor(() => expect(channels).toHaveLength(1))
+    const call = mocks.invoke.mock.calls.find(([command]) => command === 'search_notes')
+    const requestId = (call?.[1] as { requestId: number }).requestId
+
+    await user.clear(input)
+    await waitFor(() => expect(cancelled).toContain(requestId))
+
+    // A batch that races with the cancel must be dropped, not rendered.
+    await act(async () => {
+      channels[0].send({ kind: 'batch', hits: [hit('a.md', 1, 'alpha needle')] })
+    })
+    expect(screen.queryAllByText('needle', { selector: 'mark' })).toHaveLength(0)
   })
 
   it('reloads the disk version and discards the local text after a conflict', async () => {

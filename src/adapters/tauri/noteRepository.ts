@@ -1,7 +1,30 @@
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import type { NoteRepository } from '../../application/ports'
 import type { DeletedNote, NoteDocument, NoteEntry } from '../../core/notes'
-import type { SearchHit } from '../../core/search'
+import type {
+  SearchHit,
+  SearchSource,
+  SearchSummary,
+  SnapshotStatus,
+} from '../../core/search'
+
+/** Mirrors `search::SearchEvent` in Rust (ADR-008). */
+type SearchEvent =
+  | { kind: 'batch'; hits: SearchHit[] }
+  | {
+      kind: 'done'
+      total: number
+      truncated: boolean
+      tookMs: number
+      source: SearchSource
+    }
+
+const EMPTY_SUMMARY: SearchSummary = {
+  total: 0,
+  truncated: false,
+  tookMs: 0,
+  source: 'disk',
+}
 
 /**
  * The only place in the frontend that knows about Tauri command names.
@@ -41,7 +64,40 @@ export class TauriNoteRepository implements NoteRepository {
     return invoke<NoteEntry>('rename_note', { root, path, newTitle })
   }
 
-  searchNotes(root: string, query: string): Promise<SearchHit[]> {
-    return invoke<SearchHit[]>('search_notes', { root, query })
+  searchNotes(
+    root: string,
+    query: string,
+    requestId: number,
+    onBatch: (hits: SearchHit[]) => void,
+  ): Promise<SearchSummary> {
+    const channel = new Channel<SearchEvent>()
+    let summary = EMPTY_SUMMARY
+
+    channel.onmessage = (event) => {
+      if (event.kind === 'batch') {
+        onBatch(event.hits)
+        return
+      }
+      summary = {
+        total: event.total,
+        truncated: event.truncated,
+        tookMs: event.tookMs,
+        source: event.source,
+      }
+    }
+
+    // The command returns after `Done` has been sent, so every event has been
+    // delivered to `onmessage` by the time this resolves.
+    return invoke<void>('search_notes', { root, query, requestId, onEvent: channel }).then(
+      () => summary,
+    )
+  }
+
+  cancelSearch(requestId: number): Promise<void> {
+    return invoke<void>('search_cancel', { requestId })
+  }
+
+  snapshotStatus(): Promise<SnapshotStatus | null> {
+    return invoke<SnapshotStatus | null>('snapshot_status')
   }
 }

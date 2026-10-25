@@ -1,6 +1,6 @@
 import { useMemo, useState, type FormEvent } from 'react'
 import { filterNotes, type NoteEntry } from '../core/notes'
-import { highlightParts, type SearchHit } from '../core/search'
+import { highlightParts, type SearchHit, type SearchSource, type SearchSummary } from '../core/search'
 import { buildNoteTree, type TreeNode } from '../core/tree'
 
 interface SidebarProps {
@@ -11,12 +11,19 @@ interface SidebarProps {
   loading: boolean
   contentHits: SearchHit[]
   searching: boolean
+  summary: SearchSummary | null
   onQueryChange: (query: string) => void
   onOpenWorkspace: () => void
   onRefresh: () => void
   onSelect: (note: NoteEntry) => void
   onOpenHit: (hit: SearchHit) => void
   onCreate: (title: string) => void
+}
+
+const SOURCE_LABEL: Record<SearchSource, string> = {
+  snapshot: '内存快照',
+  disk: '实时扫描',
+  mixed: '部分快照',
 }
 
 function workspaceName(root: string): string {
@@ -75,6 +82,7 @@ export function Sidebar({
   loading,
   contentHits,
   searching,
+  summary,
   onQueryChange,
   onOpenWorkspace,
   onRefresh,
@@ -171,7 +179,11 @@ export function Sidebar({
           <>
             {hasQuery && (
               <div className="search-status" aria-live="polite">
-                {searching ? '搜索正文中…' : `内容命中 ${contentHits.length} 条`}
+                {searching
+                  ? '搜索正文中…'
+                  : summary
+                    ? `内容命中 ${summary.total} 条 · ${summary.tookMs} ms · ${SOURCE_LABEL[summary.source]}`
+                    : `内容命中 ${contentHits.length} 条`}
               </div>
             )}
 
@@ -213,7 +225,9 @@ export function Sidebar({
                     </li>
                   ))}
                 </ul>
-                <p className="hits-limit">最多显示 50 条结果</p>
+                <p className="hits-limit">
+                  {summary?.truncated ? '已达 50 条上限，缩小关键词可看到更多' : '最多显示 50 条结果'}
+                </p>
               </section>
             )}
 
