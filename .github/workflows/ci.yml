@@ -77,6 +77,13 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # The repo pins the Windows MSVC toolchain; other hosts must resolve
+      # their own default or rustup rejects the target triple.
+      - name: Use the host toolchain outside Windows
+        if: runner.os != 'Windows'
+        working-directory: .
+        run: rm -f rust-toolchain.toml
+
       # Tauri links against WebKitGTK even for the library's unit tests.
       - name: Install Linux system libraries
         if: runner.os == 'Linux'
