@@ -14,6 +14,7 @@
 - **2026-10-23 RFC-006 文档落位**：性能评估 + 7 轮访谈结论固化为 spec；RFC-006、ADR-007~009、plan、B4 区块完成；门禁 PASS。代码未开始，L0~L3 由 B4 区块统一跟踪。
 - **2026-10-25 RFC-006 代码闭环**：B4 区块除 L3 评估外的八项全部完成（快照/LRU、并行、流式、监听、50k 虚拟化、基准门禁）；Rust 51 passed、前端 69 passed。
 - **2026-10-25 公开仓库与三平台 CI**：`github.com/zhouweihang/md-studio` 转为 Public；Rust 测试矩阵覆盖 Windows / Ubuntu / macOS（macOS 非阻塞），连同前端测试/构建与文档门禁五个 job 全绿（`2de6ae8`）；本机 release 安装包实测可启动。
+- **2026-10-25 三端打包链路**：新增 `.github/workflows/release.yml`（四个原生 runner 并行）；`bundle.targets` 改为 `all`。手动试跑四个 job 全绿，产出 NSIS 1.80 MB + MSI 2.83 MB、deb 3.30 MB + AppImage 81.76 MB、macOS `aarch64` 2.56 MB / `x64` 2.79 MB 两个 dmg；六个文件头均校验通过，未创建 Release。
 
 ## B1. 产品能力遗留（MVP 之外）
 
@@ -64,4 +65,4 @@
 |---|---|---|---|
 | B5-1 | 版本号与发布节奏 | **策略已裁决 2026-10-25（方案 ②）**：应用版本走产品语义化 `0.x`，`0.1.0` 即首个公开版本，不随 RFC 阶段号跳动；RFC-001~006 的 `Target`（`v0.1.0`~`v0.6.0`）只是内部开发台阶，不改写 `package.json` / `tauri.conf.json`。剩余：仓库仍无 tag 与 Release | 打 `v0.1.0` tag 并发布 Release，挂上 NSIS 安装包与变更说明 |
 | B5-2 | 代码签名 | NSIS 安装包未签名，SmartScreen 报「未知发布者」 | 取得证书并在 `tauri.conf.json` 配置签名，或明确放弃并在 README 写明 |
-| B5-3 | macOS / Linux 打包 | `bundle.targets` 只有 `nsis` | 产出 `.dmg` 与 `.AppImage`/`.deb`，或明确只支持 Windows |
+| ~~B5-3~~ | macOS / Linux 打包 | `bundle.targets` 现为 `all`；`.github/workflows/release.yml` 用 `macos-latest`（arm64）、`macos-15-intel`（x64，取代已退役的 `macos-13`）、`ubuntu-22.04`、`windows-latest` 四个原生 runner | **Completed 2026-10-25**：tag / 手动触发均可出包，六个产物均为平台原生格式（NSIS+MSI、deb+AppImage、两个 dmg）；Linux 固定在 22.04 构建以兼容较老 glibc；macOS 与 Windows 均未签名，签名与公证另列一条 | 产出 `.dmg` 与 `.AppImage`/`.deb`，或明确只支持 Windows |
