@@ -84,6 +84,112 @@ button:disabled {
   height: 100%;
 }
 
+/* ---------------- Boot splash ---------------- */
+
+.boot-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(120% 90% at 50% 32%, #fdfbf5 0%, var(--bg) 58%, #e9e3d6 100%);
+  color: var(--ink);
+  animation: boot-in 220ms ease-out;
+  transition: opacity 200ms ease;
+}
+
+.boot-screen.is-leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.boot-seal {
+  width: 104px;
+  height: 104px;
+  border-radius: 26px;
+  box-shadow: 0 22px 44px rgb(94 48 26 / 20%);
+  animation: boot-seal-in 520ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.boot-name {
+  margin-top: 24px;
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.boot-caption {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+}
+
+.boot-line {
+  position: relative;
+  width: 128px;
+  height: 2px;
+  margin-top: 26px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.boot-line::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 46%;
+  background: var(--accent);
+  animation: boot-sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes boot-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes boot-seal-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes boot-sweep {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(320%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-screen,
+  .boot-seal {
+    animation: none;
+  }
+
+  .boot-line::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
 .app-body {
   display: flex;
   flex: 1;
@@ -133,15 +239,12 @@ button:disabled {
 }
 
 .brand-mark {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid #6b6557;
-  color: #e8c6b4;
-  font-family: var(--serif);
-  font-size: 21px;
-  font-weight: 600;
+  display: block;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  border-radius: 10px;
+  box-shadow: 0 6px 14px rgb(0 0 0 / 32%);
 }
 
 .brand-text {
@@ -489,6 +592,14 @@ button:disabled {
   width: min(580px, 80%);
   margin: 0 auto;
   padding: 48px 0;
+}
+
+.empty-seal {
+  width: 72px;
+  height: 72px;
+  margin-bottom: 22px;
+  border-radius: 18px;
+  box-shadow: 0 12px 28px rgb(80 45 25 / 16%);
 }
 
 .empty-kicker {

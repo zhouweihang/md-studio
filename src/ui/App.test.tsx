@@ -168,6 +168,19 @@ describe('App', () => {
   it('renders the empty state before a workspace is chosen', () => {
     render(<App />)
     expect(screen.getByRole('heading', { name: '把文件夹变成写作工作区' })).toBeTruthy()
+    expect(screen.queryByRole('status', { name: '正在恢复上次的工作区' })).toBeNull()
+  })
+
+  it('holds the seal splash while restoring the last workspace', async () => {
+    localStorage.setItem('mdstudio.workspace', 'C:\\notes')
+    render(<App />)
+
+    expect(screen.getByRole('status', { name: '正在恢复上次的工作区' })).toBeTruthy()
+    expect(await screen.findByText('hello.md')).toBeTruthy()
+    await waitFor(
+      () => expect(screen.queryByRole('status', { name: '正在恢复上次的工作区' })).toBeNull(),
+      { timeout: 3000 },
+    )
   })
 
   it('opens a workspace, edits a note, previews it, and filters the tree', async () => {

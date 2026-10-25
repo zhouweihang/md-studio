@@ -299,9 +299,7 @@ export function Sidebar({
   return (
     <aside className="sidebar">
       <div className="brand">
-        <span className="brand-mark" aria-hidden="true">
-          M
-        </span>
+        <img className="brand-mark" src="/seal.png" alt="" width={38} height={38} />
         <span className="brand-text">
           <strong>MD Studio</strong>
           <small>local markdown desk</small>

@@ -15,7 +15,11 @@ import { StatusBar, type SaveState } from './StatusBar'
 
 const service = new WorkspaceService(new TauriNoteRepository())
 const STORAGE_KEY = 'mdstudio.workspace'
+/** Keep the seal on screen briefly even when the disk answers instantly. */
+const BOOT_MIN_MS = 420
+const BOOT_FADE_MS = 200
 
+type BootPhase = 'shown' | 'leaving' | 'done'
 type ViewMode = 'split' | 'edit' | 'preview'
 
 interface OpenedNote {
@@ -66,6 +70,21 @@ function storeWorkspace(path: string | null): void {
   }
 }
 
+function BootScreen({ leaving }: { leaving: boolean }) {
+  return (
+    <div
+      className={`boot-screen${leaving ? ' is-leaving' : ''}`}
+      role="status"
+      aria-label="正在恢复上次的工作区"
+    >
+      <img className="boot-seal" src="/seal.png" alt="" width={104} height={104} />
+      <strong className="boot-name">MD Studio</strong>
+      <span className="boot-caption">正在恢复上次的工作区</span>
+      <span className="boot-line" aria-hidden="true" />
+    </div>
+  )
+}
+
 function EmptyState({
   root,
   noteCount,
@@ -79,6 +98,7 @@ function EmptyState({
 }) {
   return (
     <div className="empty-state">
+      <img className="empty-seal" src="/seal.png" alt="" width={72} height={72} />
       <span className="empty-kicker">LOCAL-FIRST MARKDOWN DESK</span>
       <h1>{root ? '选一篇笔记开始' : '把文件夹变成写作工作区'}</h1>
       <p>
@@ -114,6 +134,7 @@ export function App() {
   const [dialogBusy, setDialogBusy] = useState(false)
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [undo, setUndo] = useState<DeletedNote | null>(null)
+  const [boot, setBoot] = useState<BootPhase>(() => (readStoredWorkspace() ? 'shown' : 'done'))
   const saverRef = useRef<DebouncedSaver | null>(null)
   const revisionRef = useRef<string | null>(null)
   const closingRef = useRef(false)
@@ -279,13 +300,25 @@ export function App() {
     const stored = readStoredWorkspace()
     if (!stored) return
 
-    void loadWorkspace(stored).catch((caught: unknown) => {
-      storeWorkspace(null)
-      setRoot(null)
-      setNotes([])
-      setError(friendlyError(caught))
-    })
+    const startedAt = Date.now()
+    void loadWorkspace(stored)
+      .catch((caught: unknown) => {
+        storeWorkspace(null)
+        setRoot(null)
+        setNotes([])
+        setError(friendlyError(caught))
+      })
+      .finally(() => {
+        const remaining = Math.max(0, BOOT_MIN_MS - (Date.now() - startedAt))
+        window.setTimeout(() => setBoot('leaving'), remaining)
+      })
   }, [loadWorkspace])
+
+  useEffect(() => {
+    if (boot !== 'leaving') return
+    const timer = window.setTimeout(() => setBoot('done'), BOOT_FADE_MS)
+    return () => window.clearTimeout(timer)
+  }, [boot])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -650,6 +683,8 @@ export function App() {
 
   return (
     <div className="app">
+      {boot !== 'done' && <BootScreen leaving={boot === 'leaving'} />}
+
       {error && (
         <div className="error-bar" role="alert">
           <span>{error}</span>
