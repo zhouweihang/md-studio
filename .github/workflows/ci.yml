@@ -39,9 +39,24 @@ jobs:
         run: bun run build
 
   rust:
-    name: Rust tests
-    runs-on: windows-latest
-    timeout-minutes: 30
+    name: Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    # macOS runs notify on FSEvents, whose coalescing semantics differ from
+    # ReadDirectoryChangesW/inotify. Keep it visible but non-blocking until its
+    # watcher behaviour has been observed on real runners.
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            experimental: false
+          - os: ubuntu-latest
+            experimental: false
+          - os: macos-latest
+            experimental: true
 
     defaults:
       run:
@@ -56,11 +71,25 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+
+      # Tauri links against WebKitGTK even for the library's unit tests.
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
 
       # The Tauri codegen embeds the frontend dist.
       - name: Build frontend for Tauri codegen
