@@ -6,7 +6,7 @@
 
 **Goal:** 把搜索从「每次查询重扫磁盘」重构为「后台预热的内存快照 + 并行扫描 + Channel 流式返回」，10k 档暖查询 p95 ≤ 41.6 ms（= 20 ms 固定开销 + 0.10 ms/MiB × 215.6 MiB，2026-10-25 修订），50k 档可打开可搜索，并建立分机器基线的回归门禁。
 
-**Status:** In progress（Task 0–5 完成；下一步 Task 6；Task 7 按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，并完成 Task 5 流式契约，均已回填 RFC-006。
+**Status:** In progress（Task 0–6 完成；下一步 Task 7，其中侧栏虚拟化按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，完成 Task 5 流式契约与 Task 6 监听失效，均已回填 RFC-006。
 
 **权威文档：** `docs/rfc/RFC-006-search-performance.md`、`docs/specs/2026-10-23-search-performance-design.md`、ADR-007~009。
 
@@ -145,14 +145,36 @@
 
 **Files:** `src-tauri/src/watcher.rs`、`src-tauri/src/search.rs`、`src-tauri/src/lib.rs`
 
-- [ ] **Step 1**: notify 递归监听，过滤 Markdown 与忽略目录。
-- [ ] **Step 2**: 300 ms 去抖；create/modify/remove/rename 增量更新。
-- [ ] **Step 3**: 失败/溢出 → `Degraded`；查询前 mtime+size 校验。
-- [ ] **Step 4**: 手动刷新全量对账。
-- [ ] **Step 5**: 集成测试：外部写入、删除、rename 原子保存三种路径。
-- [ ] **Step 6**: `cargo test --locked --all-targets`。
+- [x] **Step 1**: notify 递归监听，过滤 Markdown 与忽略目录。
+- [x] **Step 2**: 300 ms 去抖；create/modify/remove/rename 增量更新。
+- [x] **Step 3**: 失败/溢出 → `Degraded`；查询前 mtime+size 校验。
+- [x] **Step 4**: 手动刷新全量对账。
+- [x] **Step 5**: 集成测试：外部写入、删除、rename 原子保存三种路径。
+- [x] **Step 6**: `cargo test --locked --all-targets`（49 passed）。
 
 **验收**：外部编辑 500 ms 内可见；监听被禁用时结果仍正确、状态为 `Degraded`。
+
+**结果（2026-10-25，本机 Windows）**
+
+| 场景 | 行为 | 测试 |
+|---|---|---|
+| 外部直接写入 | 300 ms 去抖后重读，新内容可见、旧内容消失 | `external_write_becomes_visible_after_debounce`，实测 300–400 ms |
+| 外部删除单篇 | 条目从快照移除，`total` 递减 | `external_delete_removes_the_note_from_the_snapshot` |
+| 外部删除目录 | 目录下所有笔记连带移除 | `external_folder_delete_drops_every_note_under_it` |
+| 原子保存（临时文件 + rename） | 非 Markdown 临时名被忽略，目标路径按 rename 后内容重读 | `atomic_save_through_a_temp_file_is_seen` |
+| 忽略目录 | `node_modules`、`.git` 内的 `.md` 不进入快照 | `ignored_folders_never_enter_the_snapshot` |
+| 监听禁用 | `Degraded` 下查询前 mtime+size 校验，外部修改仍被搜到，后台重预热 | `degraded_snapshot_revalidates_before_returning_hits` |
+| 切换工作区 | 监听重建，旧根不再监听 | `watching_is_reused_and_rebound_across_workspaces` |
+
+**实现备注**
+
+1. 事件不按 create/modify/remove 分类处理，而是去抖后对每个路径问「磁盘现在是什么」：存在 → 重读入快照，不存在 → 删条目，非 Markdown 且已消失 → 按目录前缀清理。一个规则同时覆盖原子保存、编辑器的 rename 事件与删除，避免平台事件形态差异（Windows 报 `Modify(Name)`，不同编辑器写法不一）。
+2. 监听失败（初始化、后端溢出、连续 3 次读取失败）置 `Degraded`；此后每次查询先对缓存正文做 `stat` 比对 mtime+size，失配的丢弃并后台重预热。`Degraded` 不再退回全量磁盘扫描，10k 档降级查询只多一轮 `stat`。
+3. 手动刷新（`list_notes`）按 `modified_ms` 对账：mtime 与快照记录不一致的正文直接丢弃并重新排队预热，即使监听完全失效也能收敛。
+4. 预热时把 `symlink_metadata` 已读到的 mtime 直接用作校验戳，避免为 10k 篇多付一次 `stat`——预热 2.21 s → 2.31 s，仍在噪声范围内。
+5. 测试断言 1.5 s 上限而不是 500 ms：去抖 300 ms + 事件投递在空闲机器上稳定在 300–400 ms，CI 的慢盘不该把验收口径变成偶发失败；上限只用于捕获「忘记 flush」这类结构性回归。
+6. `notify` 8.2.1（稳定版）；9.x 仍是 rc，不采用。
+7. 状态栏（`StatusBar`）常驻展示 `Warming/Ready/Degraded`、缓存字节数与 `cached/total`，`Degraded` 的 `degradedReason` 挂在 tooltip；`Warming` 时 App 每 400 ms 轮询 `snapshot_status` 直到稳定。
 
 ## Task 7: 50k 上限与侧栏虚拟化（REQ-028）
 

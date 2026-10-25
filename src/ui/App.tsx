@@ -120,6 +120,8 @@ export function App() {
   /** Monotonic search id: the backend cancels anything older (ADR-008). */
   const requestIdRef = useRef(0)
   const snapshotRef = useRef<SnapshotStatus | null>(null)
+  /** Mirrors `snapshotRef` for rendering the status bar; the ref feeds debounce. */
+  const [snapshot, setSnapshot] = useState<SnapshotStatus | null>(null)
   const noteCountRef = useRef(0)
   noteCountRef.current = notes.length
 
@@ -179,13 +181,48 @@ export function App() {
   }, [])
 
   const refreshSnapshotStatus = useCallback(async () => {
+    let next: SnapshotStatus | null = null
     try {
-      snapshotRef.current = await service.snapshotStatus()
+      next = await service.snapshotStatus()
     } catch {
-      // Only a debounce hint; a missing snapshot must never surface as an error.
-      snapshotRef.current = null
+      // Status is informational; a missing snapshot must never surface as an error.
+      next = null
     }
+    snapshotRef.current = next
+    setSnapshot(next)
   }, [])
+
+  // While the cache is warming, poll until it settles at Ready or Degraded so
+  // the status bar shows a live count instead of a stale spinner.
+  useEffect(() => {
+    if (!root) {
+      snapshotRef.current = null
+      setSnapshot(null)
+      return
+    }
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const poll = async () => {
+      let next: SnapshotStatus | null = null
+      try {
+        next = await service.snapshotStatus()
+      } catch {
+        next = null
+      }
+      if (cancelled) return
+      snapshotRef.current = next
+      setSnapshot(next)
+      if (next?.state === 'warming') timer = setTimeout(() => void poll(), 400)
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [root])
 
   const loadWorkspace = useCallback(async (path: string) => {
     setLoading(true)
@@ -693,7 +730,6 @@ export function App() {
                 )}
               </div>
 
-              <StatusBar path={opened.path} content={opened.content} dirty={dirty} state={saveState} />
             </>
           ) : (
             <EmptyState
@@ -703,6 +739,14 @@ export function App() {
               onOpen={() => void handleOpenWorkspace()}
             />
           )}
+
+          <StatusBar
+            path={opened?.path ?? null}
+            content={opened?.content ?? ''}
+            dirty={dirty}
+            state={saveState}
+            snapshot={snapshot}
+          />
         </main>
       </div>
 

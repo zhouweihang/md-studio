@@ -95,8 +95,8 @@ flowchart TB
 |---|---|---|
 | 命令层 | `list_notes` / `read_note` / `write_note` / `create_note` / `delete_note` / `restore_note` / `rename_note` / `search_notes` / `search_cancel` / `snapshot_status` 注册 | `src-tauri/src/lib.rs` |
 | 文件域 | 根规范化、相对路径校验、递归扫描（串行枚举 + 并行 stat，≤8 线程）、重名去重、5 MiB 限制、正文行扫描、内容 revision 与条件写入、系统回收站删除与会话内快照恢复 | `src-tauri/src/notes.rs` |
-| 搜索引擎 | 内存快照（后台预热、LRU 预算、`Warming/Ready/Degraded`）、并行匹配、整篇扫描、片段生成；`SearchEvent` 流式（Batch ≤16 / 唯一 Done / `request_id` 取消）；监听待 Task 6 | `src-tauri/src/search.rs` |
-| 文件监听（计划） | notify 递归监听、300 ms 去抖、增量更新快照与降级状态 | `src-tauri/src/watcher.rs` |
+| 搜索引擎 | 内存快照（后台预热、LRU 预算、`Warming/Ready/Degraded`）、并行匹配、整篇扫描、片段生成；`SearchEvent` 流式（Batch ≤16 / 唯一 Done / `request_id` 取消）；`Degraded` 时按 mtime+size 校验缓存正文 | `src-tauri/src/search.rs` |
+| 文件监听 | `notify` 递归监听、300 ms 去抖、事件归约为「磁盘现在是什么」、移除目录连带清理、连续读失败置 `Degraded`；生命周期跟随工作区（`list_notes` 重建） | `src-tauri/src/watcher.rs` |
 
 ## 3. 数据流
 
@@ -135,7 +135,7 @@ flowchart TB
 4. 查询变化或清空时，effect 清理函数调用 `search_cancel(requestId)`；Rust 的 `request_id` 单调递增，工作线程在批次边界检查并退出，前端同时丢弃迟到批次。
 5. `Sidebar` 同时渲染文件名树与内容命中；`highlightParts(preview, query)` 把命中词切分为 `<mark>`；点击命中调用 `openNote(note, line)`，`EditorPane` 定位到行。
 
-RFC-006 剩余（未实现）：监听（`watcher.rs`）增量更新快照；失败置 `Degraded`，查询前 mtime+size 校验（Task 6）。
+监听与失效（Task 6）：`watcher.rs` 去抖后把事件归约为磁盘现状——存在的 Markdown 重读、消失的删除、目录删除连带清空；失败置 `Degraded`，查询前 mtime+size 校验。
 
 ### 3.6 关闭前 flush
 
@@ -157,11 +157,11 @@ RFC-006 剩余（未实现）：监听（`watcher.rs`）增量更新快照；失
 3. 成功后刷新列表并 `openNote(restored)` 重新读取 revision；toast 关闭。
 4. 8 秒无操作后 toast 自动消失，撤销入口结束；更早的文件由系统回收站找回。
 
-### 3.9 搜索快照与失效（RFC-006 Task 4/5 已实现；监听待 Task 6）
+### 3.9 搜索快照与监听失效（RFC-006 Task 4–6）
 
 1. 打开工作区：`list_notes` 返回后后台预热，`snapshot_status` 进入 `Warming`，64 篇一批读入，不阻塞编辑；预算满即停。
 2. 查询：快照命中走内存并行扫描；未就绪、被淘汰、超限或非 UTF-8 回退读盘。应用内写/新建/删除/改名/恢复同步镜像快照。
-3. 失效：notify 事件 300 ms 去抖后增量更新；监听失败置 `Degraded`；手动刷新全量对账。**当前外部编辑要等 Task 6 才能被快照感知。**
+3. 失效：`notify` 事件 300 ms 去抖后归约为「磁盘现在是什么」——存在的 Markdown 重读、消失的删除、目录删除连带清空；隐藏/构建目录忽略。监听初始化失败、后端溢出或连续读失败置 `Degraded`，此后每次查询先用 mtime+size 校验缓存正文，失配的丢弃并后台重预热；手动刷新按 mtime 对账重建。
 4. 取消：`request_id` 单调递增，工作线程每批检查，前端丢弃迟到批次。
 5. 边界：快照只读；保存仍读盘比对 revision（ADR-005），删除/恢复/重命名语义不变。
 
@@ -211,3 +211,4 @@ RFC-006 剩余（未实现）：监听（`watcher.rs`）增量更新快照；失
 - 2026-10-24 RFC-006 L2：`search.rs` 新增只读快照（预热、LRU 预算、三态）与 `snapshot_status` 命令；查询优先读快照、逐篇回退读盘；写/删/改名/恢复同步镜像；ASCII needle 改为整篇扫描。前端与监听/流式仍未接入（Task 5/6）。
 - 2026-10-24 RFC-006 L0/L1：`search.rs` 承载匹配与片段生成（L0）并按块并行扫描（L1，`std::thread::scope`、≤8 线程）；`notes.rs` 的扫描拆为串行枚举 + 并行 stat。分层与命令契约未变。
 - 2026-10-24 RFC-006 L0/L1 验证：Rust 27 passed、`check:perf` PASS（1k 415.5→83.7 ms）；内存快照、流式与监听仍未实现。
+- 2026-10-25 RFC-006 Task 5/6：`search_notes` 改为 Channel 流式并新增 `search_cancel`；`watcher.rs` 落地 notify 监听（300 ms 去抖、磁盘现状归约、`Degraded` + mtime+size 校验）；状态栏新增快照三态与缓存大小。Rust 49 passed、前端 55 passed。

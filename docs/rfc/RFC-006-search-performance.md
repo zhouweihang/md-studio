@@ -1,6 +1,6 @@
 # RFC-006: 搜索性能重构（内存快照、流式契约与 50k 规模）（域 Search）
 
-> Status: In Progress（REQ-022/023/024/025/030 已验收，REQ-026~029 待实现） | Type: RFC | Created: 2026-10-23 | Updated: 2026-10-25 | Authors: Buffy | Reviewers: 项目所有者 | Target: v0.6.0
+> Status: In Progress（REQ-022/023/024/025/026/027/029/030 已验收，REQ-028 待实现） | Type: RFC | Created: 2026-10-23 | Updated: 2026-10-25 | Authors: Buffy | Reviewers: 项目所有者 | Target: v0.6.0
 > 索引：`RFC-006` | 关联 REQ：REQ-022~REQ-030 | 收益：10k 工作区暖查询 p95 ≤41.6 ms（约 4.1 ms/1k 篇，带宽 ≥10 GB/s），50k 可打开可搜索，搜索延迟从「随文件数线性劣化」变成可验收的指标
 > 位置：本文档为权威方案；需求与决策快照见 `docs/specs/2026-10-23-search-performance-design.md`
 
@@ -17,6 +17,8 @@
 2026-10-25：REQ-026 / REQ-029 落地（plan Task 5）。`search_notes(root, query, request_id, on_event)` 改为 Channel 流式，新增 `search_cancel`，旧的一次性返回退役；前端端口改为 `searchNotes(root, query, requestId, onBatch)`。10k 档首批结果 0.65 ms（p50）/ 0.91 ms（p95，常见词 50 条），峰值扫描 14.3 ms。
 
 2026-10-25：**修订 REQ-024 的 SLO 口径**。原目标「10k 档暖查询 p95 ≤20 ms」与语料体积不自洽——10k 语料正文 215.6 MiB，20 ms 意味着 10.8 GB/s 且不留任何调度与合并开销，而实测整篇扫描 p50 18–20 ms 已是 11–12 GB/s。改为按正文字节表达：p95 ≤ 20 ms + 0.10 ms/MiB 已缓存正文（固定开销 ≤20 ms + 带宽 ≥10 GB/s），10k 预算 41.6 ms、实测 28.4 ms。REQ-026~029（流式、监听、50k 上限与虚拟化）仍未实现。
+
+2026-10-25：REQ-027 落地（plan Task 6）。`watcher.rs` 用 `notify` 递归监听工作区，300 ms 去抖后把每个事件还原为「磁盘现在是什么」：仍存在的 Markdown 重读入快照、消失的删除、目录删除连带清空其下笔记；隐藏目录与 `node_modules`/`target`/`dist`/`build` 继续忽略。监听初始化失败、后端溢出或连续读失败置 `Degraded`，此后每次查询先用 mtime+size 校验缓存正文，失配的丢弃并在后台重预热；手动刷新按 mtime 对账重建。集成测试覆盖外部写入、删除、目录删除、原子保存、忽略目录、降级校验 6 条路径；外部编辑本机实测 300–400 ms 进入快照。状态栏同时补上三态与缓存大小。
 
 ## 1. 需求
 
@@ -128,7 +130,7 @@ struct CacheEntry {
 - **单篇上限**：仍受 `MAX_FILE_BYTES = 5 MiB` 约束；超限或非 UTF-8 的笔记不进入快照，永远走实时读盘。
 - **清理**：切换工作区时丢弃整个快照；应用退出不持久化。
 
-实现（2026-10-24）：`Snapshot` 持有路径有序的 `Vec<SnapshotNote>`（`path/title` 用 `Arc<str>`，正文 `Option<Arc<str>>`）+ `path → index` + `tick → path` 的 `BTreeMap` 充当 LRU 链表；扫描时只克隆 `Arc`，锁在扫描前释放。`list_notes` 成功后调用 `start_warm`，换工作区（root 不匹配）时整体替换并丢弃旧快照；同工作区刷新只对账列表，保留已有正文，只为新路径排队。预热达到预算即停止读盘（剩余预算装不下 5 MiB 上限的单篇时收工），不读完整个工作区再淘汰；LRU 淘汰仍用于应用内写入促成的插入。应用内写/新建/删除/改名/恢复会同步镜像快照（外部编辑器修改要等 ADR-009 监听落地）。预热用普通 `std::thread` 而不用 `spawn_blocking`：工作不依赖 async runtime，基准可同步复用。为服务毫秒级目标，ASCII needle 改为整篇扫描 + 命中处回算行号（逐行 `find` 在 10k 档有千万次调用），快照路径线程上限 16、磁盘路径仍为 8。
+实现（2026-10-24）：`Snapshot` 持有路径有序的 `Vec<SnapshotNote>`（`path/title` 用 `Arc<str>`，正文 `Option<Arc<str>>`）+ `path → index` + `tick → path` 的 `BTreeMap` 充当 LRU 链表；扫描时只克隆 `Arc`，锁在扫描前释放。`list_notes` 成功后调用 `start_warm`，换工作区（root 不匹配）时整体替换并丢弃旧快照；同工作区刷新只对账列表，保留已有正文，只为新路径排队。预热达到预算即停止读盘（剩余预算装不下 5 MiB 上限的单篇时收工），不读完整个工作区再淘汰；LRU 淘汰仍用于应用内写入促成的插入。应用内写/新建/删除/改名/恢复会同步镜像快照，外部编辑器修改由 ADR-009 监听同步。预热用普通 `std::thread` 而不用 `spawn_blocking`：工作不依赖 async runtime，基准可同步复用。为服务毫秒级目标，ASCII needle 改为整篇扫描 + 命中处回算行号（逐行 `find` 在 10k 档有千万次调用），快照路径线程上限 16、磁盘路径仍为 8。
 
 ### 4.5 流式契约（REQ-026）
 
@@ -164,7 +166,7 @@ pub fn search_cancel(request_id: u64);
 
 - `notify` 递归监听工作区，只处理 `.md/.markdown/.mdown` 与目录事件，隐藏目录、`node_modules`、`target`、`dist`、`build` 继续忽略。
 - 事件去抖 300 ms 后合并处理：`create/modify` 重读该文件，`remove` 删条目，`rename` 删旧键插新键。
-- 监听初始化失败、事件溢出或连续读失败 → `Degraded`；查询前对命中的笔记做 mtime+size 校验，不一致则重读并更新。
+- 监听初始化失败、事件溢出或连续读失败 → `Degraded`；此后每次查询先对缓存正文做 mtime+size 校验，不一致则丢弃该正文、回退读盘并在后台重预热。`Degraded` 不整体回退磁盘扫描，代价是每查询一轮 `stat`。
 - 手动刷新执行全量对账：重新遍历并重建快照。
 - 原子保存（临时文件 + rename）依赖 rename/create 事件；集成测试必须覆盖该路径。
 
@@ -203,7 +205,7 @@ pub fn search_cancel(request_id: u64);
 |---|---|
 | 快照预热中 | 搜索走实时扫描；UI 显示「预热中 n/N」；不报错 |
 | 条目被淘汰 | 单篇回退读盘；结果不变；状态不降级 |
-| 监听初始化失败/溢出 | 置 `Degraded`；查询前 mtime 校验；UI 提示「实时扫描」 |
+| 监听初始化失败/溢出 | 置 `Degraded`；查询前 mtime+size 校验；状态栏显示「缓存已降级」并挂 `degradedReason` |
 | Channel 关闭（窗口卸载） | Rust 侧写事件失败即退出任务；不 panic |
 | 取消后仍有批次到达 | 前端按 `request_id` 丢弃 |
 | 文件非 UTF-8 或 >5 MiB | 不进入快照；实时扫描时跳过该文件（与现状一致） |
@@ -218,9 +220,9 @@ pub fn search_cancel(request_id: u64);
 | REQ-022 | 1k 基准 ≥10% 提升；匹配语义用例全绿 | **通过 2026-10-23**：暖 p50 1k −30.1%、10k −28.9%、50k −26.6%；`aho-corasick` ASCII 匹配、按需片段、排序 key 预计算、搜索路径去 canonicalize；Rust 26 passed |
 | REQ-023 | 1k ≤120 ms；与串行结果逐条一致 | **通过 2026-10-24**：1k 暖 p50 83.7 ms / p95 93.3 ms，10k 793.8 ms，50k 4,322.1 ms（L0 为 290.3 / 2,880.8 / 14,881.8）；跨块顺序由块序拼接 + 主线程截断保证，`parallel_scan_matches_serial_scan_hit_for_hit` 逐条比对；Rust 27 passed |
 | REQ-024 | 全缓存时暖查询 p95 ≤ 20 ms + 0.10 ms/MiB 已缓存正文；LRU 单测 | **通过 2026-10-25（SLO 同日修订，见 §1 注）**：暖 p50 1k 4.1 / 10k 19.8 / 50k 2,509.8 ms（L1 为 83.7 / 793.8 / 4,322.1），p95 15.3 / 28.4 / 2,657.1 ms。对 1k（27.3 MiB）预算 22.7 ms、10k（215.6 MiB）预算 41.6 ms，两档余量均约 32%，说明「固定项 + 线性项」模型与实测吻合。LRU 预算/淘汰/记账单测覆盖，零缓存与部分缓存结果逐条等于实时扫描。50k 因 256 MB 预算只缓存 11,520 / 50,000 篇，属部分缓存，按「结果与实时扫描逐条一致 + 记录 cached/total」验收，不套用该 SLO |
-| REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | **通过 2026-10-24**：`list_notes` 返回后后台预热（1k 225 ms / 10k 2.21 s / 50k 8.25 s），UI 不等待；`snapshot_status` 返回 `Warming/Ready/Degraded` 与 total/cached/bytes/budget；预算耗尽记 `Ready` 且部分命中，全部读失败记 `Degraded`，未就绪或降级时全程回退实时扫描 |
+| REQ-025 | 打开工作区不阻塞；三态可见；失败降级 | **通过 2026-10-24**：`list_notes` 返回后后台预热（1k 225 ms / 10k 2.21 s / 50k 8.25 s），UI 不等待；`snapshot_status` 返回 `Warming/Ready/Degraded` 与 total/cached/bytes/budget；预算耗尽记 `Ready` 且部分命中，全部读失败记 `Degraded`，未就绪时回退实时扫描；状态栏常驻展示三态、缓存字节数与 `cached/total`（`StatusBar` 用例 5 条） |
 | REQ-026 | Channel 契约测试；旧命令移除；取消无副作用 | **通过 2026-10-25**：`search_stream_blocking` 以批次 ≤16 发送、`Done` 唯一（单测断言事件数与末事件）；取消后不再发 `Done`、不报错，前端按 `requestId` 丢弃迟到批次（App 测试）；旧的一次性 `invoke('search_notes')` 签名已无调用方，`SearchHit[]` 不再穿过命令边界；Rust 42 passed、前端 47 passed |
-| REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | 待实现（plan Task 6） |
+| REQ-027 | 临时目录外部修改 500 ms 内可见；监听失败降级 | **通过 2026-10-25**：`notify` 递归监听 + 300 ms 去抖；外部写入、删除、目录删除、原子保存（临时文件 + rename）四条集成测试断言 1.5 s 内可见（本机实测 300–400 ms，测试上限只用于捕获「flush 丢失」这类回归）；监听失败与事件溢出置 `Degraded`，查询前按 mtime+size 校验并重读失配条目，降级用例断言无监听时外部修改仍能被搜到；忽略目录用例断言 `node_modules`、`.git` 不进入快照；Rust 49 passed |
 | REQ-028 | 50k 可打开可搜索；树虚拟化；键盘/无障碍用例 | 待实现（plan Task 7） |
 | REQ-029 | App 测试覆盖 80/120/200 ms 选择；首屏计时 | **通过 2026-10-25**：`searchDebounceMs` 覆盖 80/120/200 三档（单测），App 在 `Warming`/无快照时取 200 ms、`Ready` 时取 80/120 ms；10k 档首批 0.65 ms p50 / 0.91 ms p95（`bench_search --query the`，50 条命中），加 80 ms 防抖仍 ≤81 ms，满足 ≤100 ms |
 | REQ-030 | 三档基准可复现；基线 JSON；1.2×/2× 判定 | **通过 2026-10-23**：基线入库；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 自检均通过；基准不进 CI |
@@ -245,4 +247,4 @@ pub fn search_cancel(request_id: u64);
 - 架构视图：C2（容器依赖）、C3（新增 Snapshot/Watcher/Channel 组件）
 - 实现落点：`src-tauri/src/search.rs`、`src-tauri/src/watcher.rs`、`src-tauri/src/notes.rs`、`src-tauri/src/bin/bench_search.rs`、`src/adapters/tauri/noteRepository.ts`、`src/application/{ports,workspace}.ts`、`src/ui/{App,Sidebar}.tsx`
 - 文档：`README.md`、`knowledge.md`
-- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁），均已推送至 `origin/main` 并通过 CI（web / Rust 36 passed / docs 三 job）。已上线 REQ-026（流式契约与取消，plan Task 5）与 REQ-029 的 80/120/200 ms 防抖。待实现 REQ-027（监听，Task 6）、REQ-028（50k 上限与侧栏虚拟化，Task 7——虚拟化按项目所有者要求暂缓）。已知缺口：ADR-009 监听落地前，外部编辑器修改不会被快照感知，仅应用内写入自动镜像。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。
+- 状态：**In Progress**。已上线 REQ-022（L0）、REQ-023（L1）、REQ-024/025（L2 快照与预热）、REQ-030（基准门禁）、REQ-026（流式契约与取消，Task 5）、REQ-029 的 80/120/200 ms 防抖，均已推送至 `origin/main` 并通过 CI（web / Rust / docs 三 job）。REQ-027（notify 监听与失效，Task 6）已实现并通过 49 个 Rust 用例：外部编辑 300–400 ms 可见，监听失败转 `Degraded` 后按 mtime+size 校验。待实现 REQ-028（50k 上限与侧栏虚拟化，Task 7——虚拟化按项目所有者要求暂缓）。REQ-024 的 SLO 口径于 2026-10-25 修订为按字节表达。

@@ -43,7 +43,16 @@ pub struct DeletedNote {
     pub content: Option<String>,
 }
 
-fn is_markdown(path: &Path) -> bool {
+/// Directories and files the workspace never enters, shared with the watcher so
+/// events cannot re-introduce what enumeration skips (ADR-009).
+pub(crate) fn is_ignored_segment(name: &str) -> bool {
+    name.starts_with('.')
+        || IGNORED_DIRS
+            .iter()
+            .any(|ignored| name.eq_ignore_ascii_case(ignored))
+}
+
+pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| MARKDOWN_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
@@ -154,7 +163,7 @@ fn resolve_target(root: &Path, relative: &str) -> AppResult<PathBuf> {
     Ok(candidate)
 }
 
-fn modified_ms(metadata: &fs::Metadata) -> Option<u64> {
+pub(crate) fn modified_ms(metadata: &fs::Metadata) -> Option<u64> {
     metadata
         .modified()
         .ok()
@@ -215,18 +224,14 @@ fn collect_note_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
             }
 
             if file_type.is_dir() {
-                if name.starts_with('.')
-                    || IGNORED_DIRS
-                        .iter()
-                        .any(|ignored| name.eq_ignore_ascii_case(ignored))
-                {
+                if is_ignored_segment(&name) {
                     continue;
                 }
                 pending.push((entry.path(), depth + 1));
                 continue;
             }
 
-            if !file_type.is_file() || name.starts_with('.') {
+            if !file_type.is_file() || is_ignored_segment(&name) {
                 continue;
             }
 
@@ -363,10 +368,16 @@ pub(crate) fn list_note_entries_at(root: &Path) -> AppResult<Vec<NoteEntry>> {
 
 #[tauri::command]
 pub fn list_notes(root: String) -> AppResult<Vec<NoteEntry>> {
-    let notes = list_note_entries_at(&canonical_root(&root)?)?;
+    let root_path = canonical_root(&root)?;
+    let notes = list_note_entries_at(&root_path)?;
     // Opening or refreshing a workspace starts the background warm-up; the UI
     // never waits for it (RFC-006 §4.4).
     crate::search::start_warm(&root, &notes);
+    // Watching is best-effort (ADR-009): without it the snapshot still answers
+    // queries, but every query first revalidates cached bodies by mtime+size.
+    if let Err(reason) = crate::watcher::watch_workspace(&root_path) {
+        crate::search::mark_degraded(&root_path, &reason);
+    }
     Ok(notes)
 }
 

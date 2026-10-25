@@ -10,7 +10,7 @@ use aho_corasick::AhoCorasick;
 use serde::Serialize;
 
 use crate::notes::{
-    MAX_FILE_BYTES, NoteEntry, canonical_root, ensure_within, list_note_entries_at,
+    MAX_FILE_BYTES, NoteEntry, canonical_root, ensure_within, list_note_entries_at, modified_ms,
     relative_note_path, worker_count,
 };
 
@@ -211,9 +211,14 @@ pub fn search_stream_blocking(
 }
 
 /// Snapshot items when the warm cache is ready, otherwise a disk-backed list.
+/// In `Degraded` mode cached bodies are revalidated first, so a missed event can
+/// only cost a re-read, never a stale hit (RFC-006 §4.6).
 fn scan_items_for(root: &Path) -> Result<(Vec<ScanItem>, SearchSource), String> {
-    if let Some(items) = active_snapshot(root).and_then(|snapshot| snapshot.ready_items()) {
-        return Ok((items, SearchSource::Snapshot));
+    if let Some(snapshot) = active_snapshot(root) {
+        validate_degraded(&snapshot);
+        if let Some(items) = snapshot.scan_items() {
+            return Ok((items, SearchSource::Snapshot));
+        }
     }
 
     let notes = list_note_entries_at(root)?;
@@ -588,6 +593,15 @@ fn collect_line_hits(
 /// Re-running `canonicalize` for every note only repeats syscalls, so the search
 /// path validates lexically and rejects symlinks with a single `lstat`.
 fn resolve_search_target(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    resolve_search_target_with_metadata(root, relative).map(|(path, _)| path)
+}
+
+/// Same validation, but hands back the metadata the check already read so the
+/// warm path does not need a second `stat` for the mtime stamp.
+fn resolve_search_target_with_metadata(
+    root: &Path,
+    relative: &str,
+) -> Result<(PathBuf, fs::Metadata), String> {
     let cleaned = relative_note_path(relative)?;
     let candidate = root.join(cleaned);
     ensure_within(root, &candidate)?;
@@ -601,7 +615,7 @@ fn resolve_search_target(root: &Path, relative: &str) -> Result<PathBuf, String>
         return Err("note path is not a file".to_string());
     }
 
-    Ok(candidate)
+    Ok((candidate, metadata))
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +627,12 @@ struct SnapshotNote {
     title: Arc<str>,
     /// `None` means "not cached"; the scanner then reads this note from disk.
     text: Option<Arc<str>>,
+    /// Bytes of the cached body, `0` when nothing is cached. Compared against
+    /// the on-disk length when the watcher is degraded (RFC-006 §4.6).
+    size: usize,
+    /// Modification time (ms since the epoch) of the file this body came from;
+    /// `0` means unknown, and validation then compares the length only.
+    modified_ms: u64,
     /// Monotonic use counter, `0` when the note holds no text.
     last_used: u64,
     /// Whether warm-up still has to attempt this note.
@@ -648,6 +668,8 @@ impl Snapshot {
                 path: Arc::from(entry.path.as_str()),
                 title: Arc::from(entry.title.as_str()),
                 text: None,
+                size: 0,
+                modified_ms: entry.modified_ms.unwrap_or(0),
                 last_used: 0,
                 needs_warm: true,
             })
@@ -698,9 +720,11 @@ impl Snapshot {
 
     /// A stable copy of the note list for scanning. Copies only `Arc`s, so the
     /// lock is released before the scan and the bodies are never duplicated.
-    fn ready_items(&self) -> Option<Vec<ScanItem>> {
+    /// `Degraded` still serves cached bodies because callers revalidate them by
+    /// mtime+size first (RFC-006 §4.6); `Warming` falls back to disk.
+    fn scan_items(&self) -> Option<Vec<ScanItem>> {
         let inner = self.lock();
-        if inner.state != SnapshotState::Ready {
+        if !matches!(inner.state, SnapshotState::Ready | SnapshotState::Degraded) {
             return None;
         }
 
@@ -740,19 +764,19 @@ impl SnapshotInner {
     /// Fills in the cache for a freshly read note without ever exceeding the
     /// budget. Warm-up uses this so a workspace larger than the budget caches a
     /// prefix instead of reading gigabytes to keep the tail.
-    fn warm_text(&mut self, path: &str, text: Arc<str>) {
+    fn warm_text(&mut self, path: &str, text: Arc<str>, modified_ms: u64) {
         let Some(&index) = self.index.get(path) else {
             return;
         };
         if text.len() > self.budget || self.bytes + text.len() > self.budget {
             return;
         }
-        self.replace_text(index, text);
+        self.replace_text(index, text, modified_ms);
     }
 
     /// Caches a body written by this app. Evicts least-recently-used text to
     /// stay inside the budget (RFC-006 §4.4), which only costs speed later.
-    fn cache_text(&mut self, path: &str, text: Arc<str>) {
+    fn cache_text(&mut self, path: &str, text: Arc<str>, modified_ms: u64) {
         let Some(&index) = self.index.get(path) else {
             return;
         };
@@ -760,17 +784,19 @@ impl SnapshotInner {
             self.drop_text(index);
             return;
         }
-        self.replace_text(index, text);
+        self.replace_text(index, text, modified_ms);
         self.evict_to_budget();
     }
 
-    fn replace_text(&mut self, index: usize, text: Arc<str>) {
+    fn replace_text(&mut self, index: usize, text: Arc<str>, modified_ms: u64) {
         let path = self.notes[index].path.to_string();
         self.drop_text(index);
 
         self.tick += 1;
         let note = &mut self.notes[index];
         note.last_used = self.tick;
+        note.size = text.len();
+        note.modified_ms = modified_ms;
         self.bytes += text.len();
         note.text = Some(text);
         self.lru.insert(self.tick, path);
@@ -781,6 +807,7 @@ impl SnapshotInner {
         if let Some(old) = note.text.take() {
             self.bytes = self.bytes.saturating_sub(old.len());
         }
+        note.size = 0;
         if note.last_used != 0 {
             self.lru.remove(&note.last_used);
             note.last_used = 0;
@@ -801,7 +828,13 @@ impl SnapshotInner {
 
     /// Inserts a note at its sorted position, keeping the ordering key used by
     /// `list_notes` (case-insensitive path, then exact path).
-    fn insert_note(&mut self, path: String, title: String, text: Option<Arc<str>>) {
+    fn insert_note(
+        &mut self,
+        path: String,
+        title: String,
+        text: Option<Arc<str>>,
+        modified_ms: u64,
+    ) {
         let key = path.to_ascii_lowercase();
         let position = self.notes.partition_point(|note| {
             let note_key = note.path.to_ascii_lowercase();
@@ -816,6 +849,8 @@ impl SnapshotInner {
             path: Arc::from(path.as_str()),
             title: Arc::from(title.as_str()),
             text: None,
+            size: 0,
+            modified_ms,
             last_used: 0,
             needs_warm: text.is_none(),
         };
@@ -824,6 +859,7 @@ impl SnapshotInner {
             if text.len() <= self.budget {
                 self.tick += 1;
                 note.last_used = self.tick;
+                note.size = text.len();
                 self.bytes += text.len();
                 self.lru.insert(note.last_used, path.clone());
                 note.text = Some(text);
@@ -868,10 +904,23 @@ impl SnapshotInner {
 
         for entry in entries {
             let cached = previous.remove(&entry.path);
-            let text = cached.as_ref().and_then(|note| note.text.clone());
+            let stamp = entry.modified_ms.unwrap_or(0);
+            // A body whose recorded mtime no longer matches the fresh listing is
+            // stale. Dropping it here is what makes a manual refresh reconcile
+            // external edits even when the watcher never reported them.
+            let text = cached.as_ref().and_then(|note| {
+                if note.text.is_some() && note.modified_ms == stamp {
+                    note.text.clone()
+                } else {
+                    None
+                }
+            });
             let has_text = text.is_some();
             let last_used = cached.as_ref().map(|note| note.last_used).unwrap_or(0);
-            let needs_warm = cached.as_ref().map(|note| note.needs_warm).unwrap_or(true);
+            let needs_warm = match (&text, cached.as_ref()) {
+                (Some(_), Some(note)) => note.needs_warm,
+                _ => true,
+            };
 
             if let Some(text) = &text {
                 self.bytes += text.len();
@@ -882,7 +931,9 @@ impl SnapshotInner {
             self.notes.push(SnapshotNote {
                 path: Arc::from(entry.path.as_str()),
                 title: Arc::from(entry.title.as_str()),
+                size: text.as_ref().map(|body| body.len()).unwrap_or(0),
                 text,
+                modified_ms: stamp,
                 last_used: if has_text { last_used } else { 0 },
                 needs_warm,
             });
@@ -936,6 +987,23 @@ pub fn start_warm(root: &str, entries: &[NoteEntry]) {
     let Some(snapshot) = prepare(&root_path, entries) else {
         return;
     };
+
+    // `prepare` already claimed the warm flag for this pass.
+    let _ = thread::Builder::new()
+        .name("search-warm".to_string())
+        .spawn(move || warm_snapshot(&snapshot));
+}
+
+/// Starts a warm pass unless one already owns the snapshot, so a validation
+/// refill cannot race the initial warm-up.
+fn spawn_warm(snapshot: Arc<Snapshot>) {
+    {
+        let mut inner = snapshot.lock();
+        if inner.warming {
+            return;
+        }
+        inner.warming = true;
+    }
 
     let _ = thread::Builder::new()
         .name("search-warm".to_string())
@@ -1003,22 +1071,26 @@ fn warm_snapshot(snapshot: &Arc<Snapshot>) {
             break;
         }
 
-        let mut texts: Vec<(String, Arc<str>)> = Vec::with_capacity(batch.len());
+        let mut texts: Vec<(String, Arc<str>, u64)> = Vec::with_capacity(batch.len());
         for path in &batch {
             attempted += 1;
-            let Ok(target) = resolve_search_target(&root, path) else {
+            let Ok((target, metadata)) = resolve_search_target_with_metadata(&root, path) else {
                 continue;
             };
             let Ok(text) = fs::read_to_string(&target) else {
                 continue;
             };
-            texts.push((path.to_string(), Arc::from(text)));
+            texts.push((
+                path.to_string(),
+                Arc::from(text),
+                modified_ms(&metadata).unwrap_or(0),
+            ));
         }
         loaded += texts.len();
 
         let mut inner = snapshot.lock();
-        for (path, text) in texts {
-            inner.warm_text(&path, text);
+        for (path, text, stamp) in texts {
+            inner.warm_text(&path, text, stamp);
         }
     }
 
@@ -1069,8 +1141,18 @@ fn title_for(relative: &str) -> String {
 /// (forward slashes, no `.` segments), so a caller-supplied path is normalized
 /// the same way before it can match — or be inserted as a duplicate.
 fn cache_key(relative: &str) -> Option<String> {
-    let cleaned = relative_note_path(relative).ok()?;
-    let parts: Vec<String> = cleaned
+    relative_note_path(relative).ok()?;
+    normalized_relative(relative)
+}
+
+/// Forward-slash form of any workspace-relative path. Unlike `cache_key` this
+/// accepts directories, so a removed folder can drop its notes.
+fn normalized_relative(relative: &str) -> Option<String> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return None;
+    }
+    let parts: Vec<String> = candidate
         .components()
         .filter_map(|component| match component {
             std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
@@ -1084,6 +1166,14 @@ fn cache_key(relative: &str) -> Option<String> {
     }
 }
 
+/// Last-write stamp used to decide whether a cached body still matches disk.
+fn modified_stamp(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| modified_ms(&metadata))
+        .unwrap_or(0)
+}
+
 /// Mirrors a successful in-app write into the snapshot. The cache never decides
 /// what to save (ADR-005: `write_note` still compares revisions on disk); it
 /// only avoids serving the body we just replaced.
@@ -1094,15 +1184,16 @@ pub(crate) fn cache_upsert(root: &Path, relative: &str, text: &str) {
     let Some(key) = cache_key(relative) else {
         return;
     };
+    let stamp = modified_stamp(&root.join(&key));
     let mut inner = snapshot.lock();
     let title = title_for(&key);
 
     match inner.index.get(&key).copied() {
         Some(index) => {
             inner.notes[index].title = Arc::from(title.as_str());
-            inner.cache_text(&key, Arc::from(text));
+            inner.cache_text(&key, Arc::from(text), stamp);
         }
-        None => inner.insert_note(key, title, Some(Arc::from(text))),
+        None => inner.insert_note(key, title, Some(Arc::from(text)), stamp),
     }
 }
 
@@ -1123,6 +1214,7 @@ pub(crate) fn cache_rename(root: &Path, from: &str, to: &str) {
     let (Some(from), Some(to)) = (cache_key(from), cache_key(to)) else {
         return;
     };
+    let stamp = modified_stamp(&root.join(&to));
     let mut inner = snapshot.lock();
     let Some(position) = inner.index.get(&from).copied() else {
         return;
@@ -1136,7 +1228,165 @@ pub(crate) fn cache_rename(root: &Path, from: &str, to: &str) {
         inner.index.insert(path, offset);
     }
 
-    inner.insert_note(to.clone(), title_for(&to), text);
+    inner.insert_note(to.clone(), title_for(&to), text, stamp);
+}
+
+/// Result of mirroring one externally changed path into the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloadOutcome {
+    /// The new body is cached.
+    Updated,
+    /// The path no longer exists, so the entry was dropped.
+    Removed,
+    /// The path exists but could not be read or is not cacheable.
+    Failed,
+}
+
+/// Re-reads one note and mirrors it into the snapshot. This is the watcher's
+/// single entry point (ADR-009): create, modify, remove and rename all reduce to
+/// "look at disk now", which also handles editors that save atomically through a
+/// temporary file and a rename.
+pub(crate) fn cache_reload(root: &Path, relative: &str) -> ReloadOutcome {
+    let Some(snapshot) = active_snapshot(root) else {
+        return ReloadOutcome::Removed;
+    };
+    let Some(key) = cache_key(relative) else {
+        return ReloadOutcome::Removed;
+    };
+
+    let (target, metadata) = match resolve_search_target_with_metadata(root, &key) {
+        Ok(found) => found,
+        Err(_) => {
+            snapshot.lock().remove_path(&key);
+            return ReloadOutcome::Removed;
+        }
+    };
+    let stamp = modified_ms(&metadata).unwrap_or(0);
+
+    // Too large or not valid UTF-8: keep the entry so the note stays listed, but
+    // drop any body, which sends the next query to disk for it.
+    let text = if metadata.len() <= MAX_FILE_BYTES {
+        fs::read_to_string(&target).ok()
+    } else {
+        None
+    };
+
+    let updated = text.is_some();
+    let mut inner = snapshot.lock();
+    let title = title_for(&key);
+    match text {
+        Some(text) => match inner.index.get(&key).copied() {
+            Some(index) => {
+                inner.notes[index].title = Arc::from(title.as_str());
+                inner.cache_text(&key, Arc::from(text), stamp);
+            }
+            None => inner.insert_note(key, title, Some(Arc::from(text)), stamp),
+        },
+        None => match inner.index.get(&key).copied() {
+            Some(index) => {
+                inner.notes[index].modified_ms = stamp;
+                inner.drop_text(index);
+            }
+            None => inner.insert_note(key, title, None, stamp),
+        },
+    }
+
+    if updated {
+        ReloadOutcome::Updated
+    } else {
+        ReloadOutcome::Failed
+    }
+}
+
+/// Drops every note under a removed directory.
+pub(crate) fn cache_remove_subtree(root: &Path, relative: &str) {
+    let Some(snapshot) = active_snapshot(root) else {
+        return;
+    };
+    let Some(key) = normalized_relative(relative) else {
+        return;
+    };
+
+    let prefix = format!("{key}/");
+    let mut inner = snapshot.lock();
+    let victims: Vec<String> = inner
+        .notes
+        .iter()
+        .filter(|note| note.path.as_ref() == key || note.path.starts_with(&prefix))
+        .map(|note| note.path.to_string())
+        .collect();
+
+    for path in victims {
+        inner.remove_path(&path);
+    }
+}
+
+/// Marks the snapshot as serving possibly stale bodies (ADR-009). Queries keep
+/// using the cache but revalidate every cached note first.
+pub(crate) fn mark_degraded(root: &Path, reason: &str) {
+    let Some(snapshot) = active_snapshot(root) else {
+        return;
+    };
+    let mut inner = snapshot.lock();
+    inner.state = SnapshotState::Degraded;
+    inner.degraded_reason = Some(reason.to_string());
+}
+
+/// Revalidates cached bodies with mtime+size before a degraded query. Mismatched
+/// notes lose their body (so they are re-read from disk) and a background warm
+/// pass refills them; matching notes keep the cache path.
+fn validate_degraded(snapshot: &Arc<Snapshot>) {
+    let (root, state) = {
+        let inner = snapshot.lock();
+        (inner.root.clone(), inner.state)
+    };
+    if state != SnapshotState::Degraded {
+        return;
+    }
+
+    let candidates: Vec<(String, usize, u64)> = {
+        let inner = snapshot.lock();
+        inner
+            .notes
+            .iter()
+            .filter(|note| note.text.is_some())
+            .map(|note| (note.path.to_string(), note.size, note.modified_ms))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut stale = Vec::new();
+    for (path, size, stamp) in candidates {
+        let Ok((_, metadata)) = resolve_search_target_with_metadata(&root, &path) else {
+            stale.push(path);
+            continue;
+        };
+        let same_size = metadata.len() == size as u64;
+        let same_stamp = stamp == 0 || modified_ms(&metadata).unwrap_or(0) == stamp;
+        if !(same_size && same_stamp) {
+            stale.push(path);
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+
+    {
+        let mut inner = snapshot.lock();
+        if inner.state != SnapshotState::Degraded {
+            return;
+        }
+        for path in stale {
+            if let Some(&index) = inner.index.get(&path) {
+                inner.drop_text(index);
+                inner.notes[index].needs_warm = true;
+            }
+        }
+    }
+
+    spawn_warm(Arc::clone(snapshot));
 }
 
 #[cfg(test)]
@@ -1500,20 +1750,20 @@ mod tests {
         let snapshot = test_snapshot(temp.path(), &["a.md", "b.md", "c.md", "d.md"], 10);
         let mut inner = snapshot.lock();
 
-        inner.cache_text("a.md", Arc::from("aaaa"));
-        inner.cache_text("b.md", Arc::from("bbbb"));
+        inner.cache_text("a.md", Arc::from("aaaa"), 1);
+        inner.cache_text("b.md", Arc::from("bbbb"), 2);
         assert_eq!(inner.bytes, 8);
 
-        inner.cache_text("c.md", Arc::from("cccc"));
+        inner.cache_text("c.md", Arc::from("cccc"), 3);
         assert_eq!(cached_paths(&inner), vec!["b.md", "c.md"]);
         assert_eq!(inner.bytes, 8);
 
-        inner.cache_text("d.md", Arc::from("dddd"));
+        inner.cache_text("d.md", Arc::from("dddd"), 4);
         assert_eq!(cached_paths(&inner), vec!["c.md", "d.md"]);
         assert_eq!(inner.bytes, 8);
 
         // A note larger than the whole budget is never cached.
-        inner.cache_text("a.md", Arc::from("x".repeat(11)));
+        inner.cache_text("a.md", Arc::from("x".repeat(11)), 5);
         assert_eq!(cached_paths(&inner), vec!["c.md", "d.md"]);
         assert!(inner.bytes <= inner.budget);
     }
@@ -1554,7 +1804,7 @@ mod tests {
                 let mut inner = snapshot.lock();
                 for note in entries.iter() {
                     let text = fs::read_to_string(root_path.join(&note.path)).unwrap();
-                    inner.warm_text(&note.path, Arc::from(text));
+                    inner.warm_text(&note.path, Arc::from(text), 1);
                 }
             }
             install_snapshot(&snapshot);
@@ -1592,13 +1842,13 @@ mod tests {
         let snapshot = Snapshot::new(root_path.clone(), &entries, usize::MAX);
         for note in entries.iter() {
             let text = fs::read_to_string(root_path.join(&note.path)).unwrap();
-            snapshot.lock().warm_text(&note.path, Arc::from(text));
+            snapshot.lock().warm_text(&note.path, Arc::from(text), 1);
         }
         assert_eq!(snapshot.status().cached, entries.len());
 
         let snapshot = Arc::new(snapshot);
         install_snapshot(&snapshot);
-        assert_eq!(snapshot.ready_items().unwrap().len(), entries.len());
+        assert_eq!(snapshot.scan_items().unwrap().len(), entries.len());
 
         let warm = search_notes_blocking(&root_string, "needle").unwrap();
         let cold = search_disk_blocking(&Matcher::new("needle"), &root_path).unwrap();
@@ -1644,7 +1894,7 @@ mod tests {
             let mut inner = snapshot.lock();
             for note in entries.iter() {
                 let text = fs::read_to_string(root_path.join(&note.path)).unwrap();
-                inner.warm_text(&note.path, Arc::from(text));
+                inner.warm_text(&note.path, Arc::from(text), 1);
             }
         }
         install_snapshot(&snapshot);

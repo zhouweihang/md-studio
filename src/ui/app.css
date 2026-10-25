@@ -856,6 +856,28 @@ details[open] > summary .tree-caret {
   color: var(--red);
 }
 
+.snapshot-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.snapshot-count {
+  color: var(--muted);
+}
+
+.snapshot-warming {
+  color: var(--amber);
+}
+
+.snapshot-ready {
+  color: var(--green);
+}
+
+.snapshot-degraded {
+  color: var(--red);
+}
+
 .conflict-banner {
   display: flex;
   align-items: center;

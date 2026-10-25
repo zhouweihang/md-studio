@@ -1,5 +1,6 @@
 mod notes;
 pub mod search;
+pub mod watcher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

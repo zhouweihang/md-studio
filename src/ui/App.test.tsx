@@ -178,6 +178,17 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: /architecture\.md/ })).toBeTruthy()
   })
 
+  it('shows the warm-cache state and size in the status bar', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: '打开 Markdown 文件夹' }))
+    await screen.findByText('hello.md')
+
+    expect(await screen.findByText(/搜索缓存 · 64 B/)).toBeTruthy()
+    expect(screen.getByText('2/2 篇')).toBeTruthy()
+  })
+
   it('creates a note from the sidebar and opens it', async () => {
     const created = {
       path: 'idea.md',

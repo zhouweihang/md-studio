@@ -37,6 +37,26 @@ export interface SearchSummary {
 }
 
 /**
+ * Human-readable byte size for the snapshot chip in the status bar.
+ * Binary units, one decimal below 10 (e.g. `64 B`, `1.5 KB`, `256 MB`).
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+
+  const rounded = value >= 10 ? Math.round(value).toString() : value.toFixed(1)
+  return `${rounded} ${units[unit]}`
+}
+
+/**
  * Adaptive debounce (RFC-006 §4.8): a warm snapshot can afford a shorter wait
  * than a warming one, where the query would still scan from disk.
  */

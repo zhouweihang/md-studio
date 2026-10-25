@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { highlightParts, mergeHits, searchDebounceMs, type SearchHit } from './search'
+import {
+  formatBytes,
+  highlightParts,
+  mergeHits,
+  searchDebounceMs,
+  type SearchHit,
+} from './search'
 
 const matches = (text: string, query: string) =>
   highlightParts(text, query)
@@ -45,6 +51,21 @@ describe('searchDebounceMs', () => {
     expect(searchDebounceMs(10, 'warming')).toBe(200)
     expect(searchDebounceMs(10, 'degraded')).toBe(200)
     expect(searchDebounceMs(10, null)).toBe(200)
+  })
+})
+
+describe('formatBytes', () => {
+  it('formats the snapshot sizes shown in the status bar', () => {
+    expect(formatBytes(64)).toBe('64 B')
+    expect(formatBytes(1_536)).toBe('1.5 KB')
+    expect(formatBytes(1.5 * 1024 * 1024)).toBe('1.5 MB')
+    expect(formatBytes(256 * 1024 * 1024)).toBe('256 MB')
+  })
+
+  it('treats missing or negative sizes as empty', () => {
+    expect(formatBytes(0)).toBe('0 B')
+    expect(formatBytes(-1)).toBe('0 B')
+    expect(formatBytes(Number.NaN)).toBe('0 B')
   })
 })
 
