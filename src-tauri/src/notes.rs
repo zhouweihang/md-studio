@@ -217,6 +217,12 @@ fn entry_for(root: &Path, path: &Path) -> Option<NoteEntry> {
 /// (one `read_dir` per folder) and stays serial; the per-note `metadata` call is
 /// what costs, so it moves to `resolve_entries` where it can run in parallel.
 fn collect_note_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
+    collect_note_paths_limited(root, MAX_NOTES)
+}
+
+/// Same walk with an explicit note cap, so the limit and its message can be
+/// tested without creating 50,000 files.
+fn collect_note_paths_limited(root: &Path, limit: usize) -> AppResult<Vec<PathBuf>> {
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     let mut paths = Vec::new();
 
@@ -257,8 +263,8 @@ fn collect_note_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
                 continue;
             }
 
-            if paths.len() >= MAX_NOTES {
-                return Err(format!("workspace contains more than {MAX_NOTES} notes"));
+            if paths.len() >= limit {
+                return Err(format!("workspace contains more than {limit} notes"));
             }
 
             paths.push(path);
@@ -625,6 +631,20 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn note_cap_reports_the_limit_instead_of_truncating() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_file(root, "a.md", "a");
+        write_file(root, "b.md", "b");
+        write_file(root, "c.md", "c");
+
+        let error = collect_note_paths_limited(root, 2).unwrap_err();
+        assert!(error.contains("more than 2 notes"), "{error}");
+        // The production cap stays at the documented 50k.
+        assert_eq!(MAX_NOTES, 50_000);
     }
 
     #[test]

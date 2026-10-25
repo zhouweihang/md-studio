@@ -6,7 +6,7 @@
 
 **Goal:** 把搜索从「每次查询重扫磁盘」重构为「后台预热的内存快照 + 并行扫描 + Channel 流式返回」，10k 档暖查询 p95 ≤ 41.6 ms（= 20 ms 固定开销 + 0.10 ms/MiB × 215.6 MiB，2026-10-25 修订），50k 档可打开可搜索，并建立分机器基线的回归门禁。
 
-**Status:** In progress（Task 0–6、Task 8 完成；Task 7 的 50k 上限已提前完成，仅侧栏虚拟化按项目所有者要求暂缓）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，完成 Task 5 流式契约、Task 6 监听失效与文件树增量、Task 8 全量验证（NSIS 1.73 MiB），均已回填 RFC-006。
+**Status:** Complete（Task 0–8 全部完成）。2026-10-25 裁决 REQ-024 的 p95 口径改为按正文字节表达，完成 Task 5 流式契约、Task 6 监听失效与文件树增量、Task 8 全量验证（NSIS 1.73 MiB），均已回填 RFC-006。
 
 **权威文档：** `docs/rfc/RFC-006-search-performance.md`、`docs/specs/2026-10-23-search-performance-design.md`、ADR-007~009。
 
@@ -184,24 +184,39 @@
 
 **Files:** `src-tauri/src/notes.rs`、`src/ui/Sidebar.tsx`、`src/ui/app.css`、测试文件
 
-- [ ] **Step 1**: `MAX_NOTES` 已在 Task 1 提前改为 50,000；仍需补上限测试与超限错误信息。
-- [ ] **Step 2**: 侧栏固定行高窗口化（24 px、overscan 20、`ResizeObserver`、可注入 `viewportHeight`）。
-- [ ] **Step 3**: 目录默认折叠；搜索过滤只渲染匹配项；保留 `tree/treeitem` 与键盘导航。
-- [ ] **Step 4**: 50k 语料打开工作区计时；IPC 体积与树构建耗时记录到 plan 或 RFC。
-- [ ] **Step 5**: 若打开 >2 s，引入按目录懒加载并另开 B4-7 子项。
+- [x] **Step 1**: `MAX_NOTES` = 50,000；`collect_note_paths_limited` 支持注入上限，用例断言超限报「more than N notes」而非静默截断。
+- [x] **Step 2**: 侧栏固定行高（24 px）窗口化，overscan 20，`ResizeObserver` 测视口，`viewportHeight` 可注入；只渲染视口行。
+- [x] **Step 3**: 目录默认折叠（新增目录也保持折叠）；搜索时展开所有含匹配的目录并只渲染匹配项；保留 `tree/treeitem`、`aria-expanded`、`aria-level` 与上下左右/Enter/Space 键盘导航。
+- [x] **Step 4**: 50k 语料实测，见下表。
+- [x] **Step 5**: 50k 打开 1.03 s（<2 s），**不引入**按目录懒加载。
 
 **验收**：50k 可打开可搜；UI 不冻结；无障碍角色与键盘用例通过。
+
+**结果（2026-10-25，release，50k 语料 1,085.5 MiB）**
+
+| 指标 | 10k | 50k | 方法 |
+|---|---|---|---|
+| `list_notes` 枚举 + stat | 221 ms | **1,029 ms** | `bench_search --list` |
+| IPC JSON | 1.02 MB | **5.10 MB** | 同上，`jsonBytes` |
+| `buildNoteTree` | 32 ms | **149 ms** | `bun scripts/bench-tree.ts` |
+| 折叠后行数 | 200 | **200** | 只有目录行 |
+| 全展开行数 / flatten | 10,200 / 0.41 ms | 50,200 / **1.09 ms** | 同上 |
+| 侧栏 DOM 行数 | ≤50 | ≤50 | 240 px 视口 + overscan 20 的窗口上限 |
+
+- 打开工作区完全不阻塞：`list_notes` 返回前 UI 只显示加载态，返回后后台预热；50k 的 1.03 s 在 IPC 之前，用户看到的是加载态而非冻结。
+- 即便全展开，50,200 行也只是数组（1.09 ms flatten），DOM 始终只有窗口内的 ~50 行；这是“50k 可打开”成立的关键。
+- 测试：`Sidebar.test.tsx` 覆盖窗口上限、滚动换窗、目录默认折叠、搜索展开、方向键与 Enter；tree 单测覆盖 flatten 与 `directoryPaths`。
 
 ## Task 8: 全量验证与回填
 
 - [x] **Step 1**: `node scripts/check-eng-docs.cjs`（ERROR 0 / WARN 0）。
-- [x] **Step 2**: `bun run typecheck`、`bun run test`（61 passed）、`bun run build`。
-- [x] **Step 3**: `cargo test --locked --all-targets`（50 passed）。
+- [x] **Step 2**: `bun run typecheck`、`bun run test`（69 passed）、`bun run build`。
+- [x] **Step 3**: `cargo test --locked --all-targets`（51 passed）。
 - [x] **Step 4**: `bun run tauri build`（NSIS 1.73 MiB，见下方记录）。
 - [x] **Step 5**: 门禁脚本 `check-search-perf.mjs` 已实现，并用基线自检 PASS 与 FAIL 两条路径；基准仍不进 CI。
 - [x] **Step 6**: 回填 RFC-006 §6/§8、README、C3、backlog 状态（`knowledge.md` 在仓库根目录之外，不属于本仓库，无法提交）。
 
-**构建记录（2026-10-25）**：`MD Studio_0.1.0_x64-setup.exe` **1,811,099 B ≈ 1.73 MiB**（release，LTO + strip）。首次 `tauri build` 失败在「failed to find main binary」：`bench_search` 让包内有了两个 bin，而 Cargo.toml 没有 `default-run`；补 `default-run = "md-studio"` 后通过。构建日志无 Rust/Cargo warning（release 编译阶段沿用首次尝试的缓存，未重打）。
+**构建记录（2026-10-25）**：`MD Studio_0.1.0_x64-setup.exe` **1,812,033 B ≈ 1.73 MiB**（release，LTO + strip；Task 7 后重打）。首次 `tauri build` 失败在「failed to find main binary」：`bench_search` 让包内有了两个 bin，而 Cargo.toml 没有 `default-run`；补 `default-run = "md-studio"` 后通过。构建日志无 Rust/Cargo warning（release 编译阶段沿用首次尝试的缓存，未重打）。
 
 ---
 

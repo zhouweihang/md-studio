@@ -226,7 +226,11 @@ describe('App', () => {
       })
     })
 
-    expect(await screen.findByText('idea.md')).toBeTruthy()
+    // A new folder shows up collapsed, like every other directory; expanding it
+    // reveals the delta without re-listing the workspace.
+    expect(await screen.findByText('drafts')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'drafts' }))
+    expect(screen.getByText('idea.md')).toBeTruthy()
     expect(screen.queryByText('architecture.md')).toBeNull()
     expect(listings()).toBe(before)
   })

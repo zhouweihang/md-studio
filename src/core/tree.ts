@@ -13,6 +13,52 @@ function compareNames(left: string, right: string): number {
   return left.localeCompare(right, 'zh-CN', { numeric: true, sensitivity: 'base' })
 }
 
+export interface TreeRow {
+  node: TreeNode
+  /** 0 for a top-level entry; directories add one per level. */
+  depth: number
+}
+
+/**
+ * Flattens the tree into the rows the sidebar actually paints. A directory is
+ * always a row; its children only appear when it is expanded, which is how
+ * collapsed folders keep 50k workspaces cheap.
+ */
+export function flattenTree(
+  nodes: readonly TreeNode[],
+  expanded: ReadonlySet<string>,
+): TreeRow[] {
+  const rows: TreeRow[] = []
+
+  const walk = (level: readonly TreeNode[], depth: number) => {
+    for (const node of level) {
+      rows.push({ node, depth })
+      if (node.type === 'dir' && expanded.has(node.path)) {
+        walk(node.children, depth + 1)
+      }
+    }
+  }
+
+  walk(nodes, 0)
+  return rows
+}
+
+/** Every directory path in the tree, used to reveal search matches. */
+export function directoryPaths(nodes: readonly TreeNode[]): string[] {
+  const paths: string[] = []
+
+  const walk = (level: readonly TreeNode[]) => {
+    for (const node of level) {
+      if (node.type !== 'dir') continue
+      paths.push(node.path)
+      walk(node.children)
+    }
+  }
+
+  walk(nodes)
+  return paths
+}
+
 export function buildNoteTree(notes: readonly NoteEntry[]): TreeNode[] {
   const root: DirBuilder = { dirs: new Map(), files: [] }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { NoteEntry } from './notes'
-import { buildNoteTree, type TreeNode } from './tree'
+import { buildNoteTree, directoryPaths, flattenTree, type TreeNode } from './tree'
 
 function note(path: string): NoteEntry {
   const name = path.split('/').at(-1) ?? path
@@ -44,6 +44,26 @@ describe('buildNoteTree', () => {
         note: note('only.md'),
       },
     ])
+  })
+
+  it('flattens collapsed folders to their own rows', () => {
+    const tree = buildNoteTree([note('a/one.md'), note('a/two.md'), note('root.md')])
+
+    expect(flattenTree(tree, new Set())).toEqual([
+      { node: tree[0], depth: 0 },
+      { node: tree[1], depth: 0 },
+    ])
+    expect(flattenTree(tree, new Set(['a'])).map((row) => `${row.depth}:${row.node.path}`)).toEqual([
+      '0:a',
+      '1:a/one.md',
+      '1:a/two.md',
+      '0:root.md',
+    ])
+  })
+
+  it('lists every directory so a search can reveal matches', () => {
+    const tree = buildNoteTree([note('a/b/deep.md'), note('c.md')])
+    expect(directoryPaths(tree)).toEqual(['a', 'a/b'])
   })
 
   it('preserves deep nesting and file metadata', () => {

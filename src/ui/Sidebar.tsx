@@ -1,7 +1,15 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type UIEvent,
+} from 'react'
 import { filterNotes, type NoteEntry } from '../core/notes'
 import { highlightParts, type SearchHit, type SearchSource, type SearchSummary } from '../core/search'
-import { buildNoteTree, type TreeNode } from '../core/tree'
+import { buildNoteTree, directoryPaths, flattenTree } from '../core/tree'
 
 interface SidebarProps {
   root: string | null
@@ -18,6 +26,8 @@ interface SidebarProps {
   onSelect: (note: NoteEntry) => void
   onOpenHit: (hit: SearchHit) => void
   onCreate: (title: string) => void
+  /** Overrides the measured scroll viewport; tests use this (RFC-006 §4.7). */
+  viewportHeight?: number
 }
 
 const SOURCE_LABEL: Record<SearchSource, string> = {
@@ -26,50 +36,179 @@ const SOURCE_LABEL: Record<SearchSource, string> = {
   mixed: '部分快照',
 }
 
+/** Fixed row height is what makes windowing possible without measuring text. */
+export const ROW_HEIGHT = 24
+/** Rows painted above and below the viewport to avoid blank flashes. */
+export const OVERSCAN = 20
+
 function workspaceName(root: string): string {
   const parts = root.split(/[\\/]/).filter(Boolean)
   return parts.at(-1) ?? root
 }
 
-function TreeBranch({
-  nodes,
-  activePath,
-  onSelect,
-}: {
-  nodes: TreeNode[]
+interface TreeViewProps {
+  rows: ReturnType<typeof flattenTree>
+  expanded: ReadonlySet<string>
   activePath: string | null
+  viewportHeight: number
+  scrollTop: number
+  onScrollTo: (top: number) => void
+  onToggle: (path: string) => void
   onSelect: (note: NoteEntry) => void
-}) {
+}
+
+/**
+ * Windowed file tree (RFC-006 §4.7): only the rows inside the viewport plus
+ * overscan are in the DOM, so a 50k-note workspace paints ~50 rows instead of
+ * 50,000. Directories are rows too, so collapsing a folder drops its subtree
+ * from the row list entirely.
+ */
+function TreeView({
+  rows,
+  expanded,
+  activePath,
+  viewportHeight,
+  scrollTop,
+  onScrollTo,
+  onToggle,
+  onSelect,
+}: TreeViewProps) {
+  const listRef = useRef<HTMLUListElement>(null)
+  const pendingFocus = useRef(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const rowHeight = ROW_HEIGHT
+
+  useEffect(() => {
+    setActiveIndex((index) => Math.min(index, Math.max(0, rows.length - 1)))
+  }, [rows.length])
+
+  useEffect(() => {
+    if (!pendingFocus.current) return
+    pendingFocus.current = false
+    const target = listRef.current?.querySelector<HTMLElement>(`[data-index="${activeIndex}"]`)
+    target?.focus()
+  }, [activeIndex])
+
+  const first = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN)
+  const covered = Math.ceil(Math.max(viewportHeight, 0) / rowHeight) + OVERSCAN * 2
+  // Without a measured viewport (no layout, e.g. jsdom) still paint a screenful.
+  const painted = Math.max(covered, OVERSCAN * 2)
+  const last = Math.min(rows.length, first + painted)
+  const visible = rows.slice(first, last)
+
+  const focusRow = (index: number) => {
+    const top = index * rowHeight
+    const outside = top < scrollTop || top + rowHeight > scrollTop + viewportHeight
+    if (outside) {
+      const centred = Math.max(0, top - viewportHeight / 2)
+      const maxTop = Math.max(0, rows.length * rowHeight - viewportHeight)
+      onScrollTo(Math.min(centred, maxTop))
+    }
+    pendingFocus.current = true
+    setActiveIndex(index)
+  }
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const row = rows[index]
+    if (!row) return
+
+    switch (event.key) {
+      case 'ArrowDown':
+        event.preventDefault()
+        if (index + 1 < rows.length) focusRow(index + 1)
+        break
+      case 'ArrowUp':
+        event.preventDefault()
+        if (index > 0) focusRow(index - 1)
+        break
+      case 'ArrowRight':
+        event.preventDefault()
+        if (row.node.type !== 'dir') break
+        if (!expanded.has(row.node.path)) onToggle(row.node.path)
+        else if (rows[index + 1]?.depth > row.depth) focusRow(index + 1)
+        break
+      case 'ArrowLeft': {
+        event.preventDefault()
+        if (row.node.type === 'dir' && expanded.has(row.node.path)) {
+          onToggle(row.node.path)
+          break
+        }
+        for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+          if (rows[candidate].depth < row.depth) {
+            focusRow(candidate)
+            break
+          }
+        }
+        break
+      }
+      case 'Enter':
+      case ' ':
+        event.preventDefault()
+        if (row.node.type === 'dir') onToggle(row.node.path)
+        else onSelect(row.node.note)
+        break
+      default:
+    }
+  }
+
   return (
-    <ul className="tree">
-      {nodes.map((node) =>
-        node.type === 'dir' ? (
-          <li key={node.path} className="tree-dir">
-            <details open>
-              <summary>
-                <span className="tree-caret" aria-hidden="true" />
-                <span className="tree-dir-name">{node.name}</span>
-              </summary>
-              <TreeBranch nodes={node.children} activePath={activePath} onSelect={onSelect} />
-            </details>
-          </li>
-        ) : (
-          <li key={node.path}>
+    <ul role="tree" aria-label="笔记文件树" ref={listRef} className="tree">
+      {visible.map((row, offset) => {
+        const index = first + offset
+        const node = row.node
+        const isDir = node.type === 'dir'
+        const open = isDir && expanded.has(node.path)
+        const selected = index === activeIndex
+
+        return (
+          <li
+            key={node.path}
+            role="treeitem"
+            aria-level={row.depth + 1}
+            aria-expanded={isDir ? open : undefined}
+            aria-selected={selected}
+            aria-current={!isDir && node.path === activePath ? 'page' : undefined}
+            className={isDir ? 'tree-dir-row' : 'tree-file-row'}
+            style={{
+              position: 'absolute',
+              top: index * rowHeight,
+              left: 0,
+              right: 0,
+              height: rowHeight,
+            }}
+          >
             <button
               type="button"
-              className={`tree-file ${node.path === activePath ? 'is-active' : ''}`}
-              aria-current={node.path === activePath ? 'page' : undefined}
+              className={
+                isDir
+                  ? `tree-row tree-dir ${open ? 'is-open' : ''}`
+                  : `tree-row tree-file ${node.path === activePath ? 'is-active' : ''}`
+              }
+              style={{ paddingLeft: 8 + row.depth * 12 }}
+              tabIndex={selected ? 0 : -1}
+              data-index={index}
               title={node.path}
-              onClick={() => onSelect(node.note)}
+              onClick={() => (isDir ? onToggle(node.path) : onSelect(node.note))}
+              onFocus={() => setActiveIndex(index)}
+              onKeyDown={(event) => handleKeyDown(event, index)}
             >
-              <span className="tree-file-mark" aria-hidden="true">
-                #
-              </span>
-              <span className="tree-file-name">{node.name}</span>
+              {isDir ? (
+                <>
+                  <span className="tree-caret" aria-hidden="true" />
+                  <span className="tree-dir-name">{node.name}</span>
+                </>
+              ) : (
+                <>
+                  <span className="tree-file-mark" aria-hidden="true">
+                    #
+                  </span>
+                  <span className="tree-file-name">{node.name}</span>
+                </>
+              )}
             </button>
           </li>
-        ),
-      )}
+        )
+      })}
     </ul>
   )
 }
@@ -89,11 +228,63 @@ export function Sidebar({
   onSelect,
   onOpenHit,
   onCreate,
+  viewportHeight,
 }: SidebarProps) {
   const [title, setTitle] = useState('')
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const [scrollTop, setScrollTop] = useState(0)
+  const [measuredViewport, setMeasuredViewport] = useState(0)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const treeRef = useRef<HTMLDivElement>(null)
+
   const filtered = useMemo(() => filterNotes(notes, query), [notes, query])
   const tree = useMemo(() => buildNoteTree(filtered), [filtered])
   const hasQuery = query.trim().length > 0
+
+  // A search only contains matching notes, so reveal every folder that holds a
+  // match; outside search the user's collapse state is respected.
+  const shownExpanded = useMemo(
+    () => (hasQuery ? new Set(directoryPaths(tree)) : expanded),
+    [expanded, hasQuery, tree],
+  )
+  const rows = useMemo(() => flattenTree(tree, shownExpanded), [shownExpanded, tree])
+
+  // Row offset inside the scroll container, so the window works even with the
+  // search status above the tree.
+  const treeOffset = () => (viewportHeight !== undefined ? 0 : (treeRef.current?.offsetTop ?? 0))
+
+  useEffect(() => {
+    if (viewportHeight !== undefined) return
+    const element = scrollRef.current
+    if (!element || typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver((entries) => {
+      setMeasuredViewport(entries[0]?.contentRect.height ?? 0)
+    })
+    observer.observe(element)
+    setMeasuredViewport(element.clientHeight)
+    return () => observer.disconnect()
+  }, [viewportHeight])
+
+  const toggleDir = (path: string) => {
+    setExpanded((current) => {
+      const next = new Set(current)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }
+
+  const handleScroll = (event: UIEvent<HTMLDivElement>) => {
+    const container = event.currentTarget
+    setScrollTop(Math.max(0, container.scrollTop - treeOffset()))
+  }
+
+  const scrollToTree = (top: number) => {
+    const container = scrollRef.current
+    if (container) container.scrollTop = treeOffset() + top
+    setScrollTop(Math.max(0, top))
+  }
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -102,6 +293,8 @@ export function Sidebar({
     onCreate(value)
     setTitle('')
   }
+
+  const effectiveViewport = viewportHeight ?? measuredViewport
 
   return (
     <aside className="sidebar">
@@ -136,11 +329,7 @@ export function Sidebar({
           <button type="button" className="button primary" onClick={onOpenWorkspace} disabled={loading}>
             打开文件夹
           </button>
-          {root && (
-            <span className="workspace-count">
-              {notes.length} 篇
-            </span>
-          )}
+          {root && <span className="workspace-count">{notes.length} 篇</span>}
         </div>
       </div>
 
@@ -173,7 +362,7 @@ export function Sidebar({
         </button>
       </form>
 
-      <div className="tree-scroll">
+      <div className="tree-scroll" ref={scrollRef} onScroll={handleScroll}>
         {!root && <p className="sidebar-empty">打开一个文件夹，开始整理你的 Markdown 笔记。</p>}
         {root && (
           <>
@@ -190,7 +379,22 @@ export function Sidebar({
             {filtered.length > 0 && (
               <section className="tree-section">
                 {hasQuery && <div className="section-label">文件名匹配</div>}
-                <TreeBranch nodes={tree} activePath={activePath} onSelect={onSelect} />
+                <div
+                  className="tree-window"
+                  ref={treeRef}
+                  style={{ height: rows.length * ROW_HEIGHT }}
+                >
+                  <TreeView
+                    rows={rows}
+                    expanded={shownExpanded}
+                    activePath={activePath}
+                    viewportHeight={effectiveViewport}
+                    scrollTop={scrollTop}
+                    onScrollTo={scrollToTree}
+                    onToggle={toggleDir}
+                    onSelect={onSelect}
+                  />
+                </div>
               </section>
             )}
 

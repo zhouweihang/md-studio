@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use md_studio_lib::search::{
-    SearchEvent, SearchSource, degrade_snapshot, search_notes_blocking, search_stream_blocking,
-    warm_snapshot_blocking,
+    SearchEvent, SearchSource, degrade_snapshot, list_notes_report, search_notes_blocking,
+    search_stream_blocking, warm_snapshot_blocking,
 };
 
 /// Streamed requests need a fresh, monotonic id because the backend cancels
@@ -67,6 +67,8 @@ struct Args {
     /// Mark the snapshot `Degraded` after warming so every query pays the
     /// mtime+size revalidation pass (RFC-006 §4.6).
     degraded: bool,
+    /// Only list the workspace and report open cost (RFC-006 §4.7).
+    list: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -77,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
     let mut json = false;
     let mut snapshot = true;
     let mut degraded = false;
+    let mut list = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,10 +109,11 @@ fn parse_args() -> Result<Args, String> {
             "--json" => json = true,
             "--no-snapshot" => snapshot = false,
             "--degraded" => degraded = true,
+            "--list" => list = true,
             "--help" | "-h" => {
                 println!(
                     "usage: bench_search --root <dir> [--query needle] [--repeat 30] \
-                     [--warmup 5] [--no-snapshot | --degraded] [--json]"
+                     [--warmup 5] [--no-snapshot | --degraded | --list] [--json]"
                 );
                 std::process::exit(0);
             }
@@ -133,6 +137,7 @@ fn parse_args() -> Result<Args, String> {
         json,
         snapshot,
         degraded,
+        list,
     })
 }
 
@@ -152,6 +157,33 @@ fn ms(duration: Duration) -> f64 {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+
+    if args.list {
+        let started = Instant::now();
+        let (notes, json_bytes) = list_notes_report(&args.root)?;
+        let list_ms = ms(started.elapsed());
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "root": args.root,
+                    "notes": notes,
+                    "listMs": list_ms,
+                    "jsonBytes": json_bytes
+                })
+            );
+        } else {
+            println!("root:  {}", args.root);
+            println!("notes: {notes}");
+            println!("list:  {list_ms:.2} ms");
+            println!(
+                "json:  {json_bytes} bytes ({:.2} MiB)",
+                json_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        return Ok(());
+    }
 
     let cold_start = Instant::now();
     let cold_hits = search_notes_blocking(&args.root, &args.query)?;

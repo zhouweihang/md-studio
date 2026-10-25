@@ -1124,6 +1124,17 @@ pub fn warm_snapshot_blocking(root: &str) -> Result<SnapshotStatus, String> {
     Ok(snapshot.status())
 }
 
+/// Lists a workspace and reports `(notes, json_bytes)`: what the frontend
+/// receives when a workspace opens (RFC-006 §4.7). The benchmark times it.
+pub fn list_notes_report(root: &str) -> Result<(usize, usize), String> {
+    let root_path = canonical_root(root)?;
+    let entries = list_note_entries_at(&root_path)?;
+    let bytes = serde_json::to_string(&entries)
+        .map_err(|error| error.to_string())?
+        .len();
+    Ok((entries.len(), bytes))
+}
+
 /// Returns the current snapshot status, or `None` when no workspace has been
 /// opened yet.
 pub fn snapshot_status() -> Option<SnapshotStatus> {

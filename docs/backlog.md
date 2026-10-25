@@ -20,7 +20,7 @@
 | ~~B1-1~~ | 删除/重命名笔记 | RFC-002 §4.1/§4.2；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：工具栏对话框 + Rust `delete_note`/`rename_note`，路径校验与冲突拒绝有单测 | 侧栏提供删除/重命名，二次确认，Rust 侧同样做路径校验 + 单测 |
 | ~~B1-2~~ | 全文搜索 | RFC-002 §4.3；ADR-004；`search_notes` | **Completed 2026-10-23**：Rust 行扫描，250ms 防抖，返回行号/片段；上限 50 条 | 输入 300ms 内返回命中片段；>5000 文件时用派生索引，需新 ADR |
 | ~~B1-7~~ | 删除进系统回收站 | RFC-004 §4.1；ADR-006；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：`trash` crate 移入系统回收站；删除返回文本快照，toast「撤销」写回原路径；回收站失败保持文件；Rust 6 个用例 + 前端 2 个用例 | 使用平台回收站 API + 撤销入口；单测覆盖失败路径 |
-| ~~B1-3~~ | 文件系统监听 | ADR-003 Decision 2；ADR-009 | **Completed 2026-10-25**：监听服务搜索快照失效（见 B4 组的文件监听条目）与文件树；新增/删除/改名以 `workspace:changed` 增量推送，前端 `applyWorkspaceDelta` 就地 patch，正文修改不发事件（不干扰自动保存）；Rust 50 passed、前端 61 passed | 监听工作区变化并增量更新树；重命名/原子保存不丢事件 |
+| ~~B1-3~~ | 文件系统监听 | ADR-003 Decision 2；ADR-009 | **Completed 2026-10-25**：监听服务搜索快照失效（见 B4 组的文件监听条目）与文件树；新增/删除/改名以 `workspace:changed` 增量推送，前端 `applyWorkspaceDelta` 就地 patch，正文修改不发事件（不干扰自动保存）；Rust 51 passed、前端 69 passed | 监听工作区变化并增量更新树；重命名/原子保存不丢事件 |
 | ~~B1-4~~ | 并发编辑冲突检测 | RFC-003 §4.1；ADR-005；`src-tauri/src/notes.rs` | **Completed 2026-10-23**：FNV-1a revision 条件写入，冲突返回 `conflict:` 且不覆盖；UI 提供重新载入/覆盖保存；Rust 3 个用例 + 前端 3 个用例 | 保存前比较内容哈希，冲突时提示选择保留版本；补 Rust 集成测试 |
 | ~~B1-5~~ | 未保存关闭确认 | RFC-003 §4.4；`src/ui/App.tsx` | **Completed 2026-10-23**：`onCloseRequested` 先 flush 再 `close()`，失败/冲突保持窗口；前端 close 用例覆盖 | 监听 close-requested，dirty 时 flush 或弹确认 |
 | B1-6 | 多标签/多窗口 | RFC-001 §7 非目标 | 未实现；单笔记会话 | 有明确用户需求后开新 RFC，评估状态模型与内存占用 |
@@ -52,6 +52,6 @@
 | ~~B4-4~~ | 后台预热与状态机 | RFC-006 §4.4；REQ-025 | **Completed 2026-10-24**：`list_notes` 后后台预热（64 篇/批，1k 225 ms、10k 2.21 s、50k 8.25 s）；`Warming/Ready/Degraded` 与 total/cached/bytes/budget 经 `snapshot_status` 暴露；未就绪/降级回退实时扫描 | 打开工作区不阻塞；三态可见；失败降级 |
 | ~~B4-5~~ | 流式搜索契约 | RFC-006 §4.5；ADR-008；REQ-026 | **Completed 2026-10-25**：`search_notes(root, query, request_id, on_event)` 改为 Channel 流式（批次 ≤16、唯一 `Done`、`source` 三态）并新增 `search_cancel`；端口改为 `searchNotes(root, query, requestId, onBatch)`，App 管理 requestId、自适应防抖 80/120/200 ms、卸载/换词时取消；10k 首批 0.65 ms p50 / 0.91 ms p95；Rust 42 passed、前端 47 passed | 旧 `search_notes` 退役；逐批渲染；取消无迟到副作用 |
 | ~~B4-6~~ | 文件监听 + mtime 兜底 | RFC-006 §4.6；ADR-009；REQ-027 | **Completed 2026-10-25**：`watcher.rs` 用 `notify` 8 递归监听 + 300 ms 去抖，去抖后把事件归约为磁盘现状（重读 / 删除 / 目录连带清理）；初始化失败、溢出或连续读失败置 `Degraded`，查询前 mtime+size 校验并后台重预热；手动刷新按 mtime 对账；7 条集成测试覆盖外部写入、删除、目录删除、原子保存、忽略目录、降级与换工作区；Rust 49 passed | 外部编辑 500 ms 内可见；监听失败自动降级 |
-| B4-7 | 50k 上限 + 侧栏虚拟化 | RFC-006 §4.7；REQ-028 | 暂缓（项目所有者要求先不做侧栏虚拟化） | 50k 工作区可打开、可搜索；树虚拟化；键盘与无障碍不回归 |
+| ~~B4-7~~ | 50k 上限 + 侧栏虚拟化 | RFC-006 §4.7；REQ-028 | **Completed 2026-10-25**：`MAX_NOTES` 50,000 与限流单测；侧栏固定 24 px 行高窗口化（overscan 20、`ResizeObserver`、`viewportHeight` 可注入），目录默认折叠，搜索只渲染匹配；50k 枚举 1,029 ms、IPC 5.10 MB、树构建 149 ms，DOM 恒为 ~50 行（未触发 2 s 懒加载）；`Sidebar` 6 条用例覆盖窗口、滚动、折叠、搜索与键盘 | 50k 工作区可打开、可搜索；树虚拟化；键盘与无障碍不回归 |
 | ~~B4-8~~ | 基准脚本 + 基线门禁 | RFC-006 §10；REQ-030 | **Completed 2026-10-23，基线于 2026-10-24 随 L2 重采**：语料生成器、`bench_search`（`--no-snapshot` 可复现磁盘路径）、编排脚本与基线入库（暖 p50 1k 4.1 ms、10k 19.8 ms、50k 2.51 s）；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 两条路径已自检 | 1k/10k/50k 可复现；基线 JSON 入库；1.2× 中位数 / 2× p95 可判定 |
 | B4-9 | L3 触发评估（ADR-010） | spec §5 L3 | 未开始 | 触发条件成文，附候选对比维度；不实现索引 |

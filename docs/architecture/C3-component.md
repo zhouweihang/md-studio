@@ -58,7 +58,7 @@ flowchart TB
 |---|---|---|
 | 笔记模型与查询 | `NoteEntry`、`NoteDocument` 类型、排序、按路径过滤、标题/字数/行数统计 | `src/core/notes.ts` |
 | 搜索模型 | `SearchHit` 类型（路径、标题、行号、片段）、`highlightParts` 片段高亮切分 | `src/core/search.ts` |
-| 目录树 | 扁平列表 → 目录优先的有序树；空目录不出现 | `src/core/tree.ts` |
+| 目录树 | 扁平列表 → 目录优先的有序树；空目录不出现；`flattenTree` 按展开集生成可见行，`directoryPaths` 供搜索展开 | `src/core/tree.ts` |
 | 防抖保存 | 700ms 合并写入；`flush()` 支持切稿/快捷键 | `src/core/autosave.ts` |
 
 核心域不得 import React、`@tauri-apps/*` 或 DOM API；对应测试为 `*.test.ts`。
@@ -83,7 +83,7 @@ flowchart TB
 | 组件 | 职责 | 文件 |
 |---|---|---|
 | `App` | 工作区恢复、选择笔记、dirty/conflict 状态、视图模式、错误条、搜索防抖、删除/改名、撤销 toast、close-request flush | `src/ui/App.tsx` |
-| `Sidebar` | 搜索框、目录树、文件名匹配、内容命中（命中词高亮）、新建输入、刷新 | `src/ui/Sidebar.tsx` |
+| `Sidebar` | 搜索框、虚拟化目录树（24 px 行高、overscan 20、`ResizeObserver`、目录默认折叠、方向键/Enter 导航）、文件名匹配、内容命中（命中词高亮）、新建输入、刷新 | `src/ui/Sidebar.tsx` |
 | `NoteDialog` | 重命名输入/删除确认，Escape 取消、Enter 提交 | `src/ui/NoteDialog.tsx` |
 | `EditorPane` | 受控 textarea、Ctrl+S、Tab 缩进、按行定位 | `src/ui/EditorPane.tsx` |
 | `PreviewPane` | 注入清理后的 HTML、拦截外链 | `src/ui/PreviewPane.tsx` |
@@ -105,7 +105,7 @@ flowchart TB
 1. 用户点击「打开文件夹」→ `pickWorkspace()` 返回绝对路径。
 2. `WorkspaceService.list(root)` → `TauriNoteRepository.listNotes` → `invoke('list_notes')`。
 3. Rust `canonical_root` → 递归扫描 → 返回 `NoteEntry[]`（相对路径、标题、修改时间）。
-4. UI 写入 `localStorage['mdstudio.workspace']`，并用 `buildNoteTree` 渲染目录树。
+4. UI 写入 `localStorage['mdstudio.workspace']`，并用 `buildNoteTree` 构建目录树；侧栏只展开用户展开的目录，按 24 px 行高扁平化为 `flattenTree` 行并做窗口化渲染（50k 也只保留视口内约 50 个 `treeitem`）。
 
 ### 3.2 编辑与保存
 
@@ -213,4 +213,5 @@ flowchart TB
 - 2026-10-24 RFC-006 L0/L1：`search.rs` 承载匹配与片段生成（L0）并按块并行扫描（L1，`std::thread::scope`、≤8 线程）；`notes.rs` 的扫描拆为串行枚举 + 并行 stat。分层与命令契约未变。
 - 2026-10-24 RFC-006 L0/L1 验证：Rust 27 passed、`check:perf` PASS（1k 415.5→83.7 ms）；内存快照、流式与监听仍未实现。
 - 2026-10-25 RFC-006 Task 5/6：`search_notes` 改为 Channel 流式并新增 `search_cancel`；`watcher.rs` 落地 notify 监听（300 ms 去抖、磁盘现状归约、`Degraded` + mtime+size 校验）；状态栏新增快照三态与缓存大小。Rust 49 passed、前端 55 passed。
-- 2026-10-25 RFC-006 Task 6 补：监听事件以 `workspace:changed` 增量更新侧栏（`WorkspaceDelta` + `applyWorkspaceDelta`，正文修改不发事件）；降级查询改为 16 线程并行校验（10k 档从 689 ms 降到 183 ms），`bench_search --degraded` 可复现；NSIS `1.73 MiB`。Rust 50 passed、前端 61 passed。
+- 2026-10-25 RFC-006 Task 7：侧栏改为 24 px 固定行高窗口化（overscan 20、`ResizeObserver`、`viewportHeight` 可注入），目录默认折叠，搜索展开匹配；50k 枚举 1,029 ms、IPC 5.10 MB、树构建 149 ms，DOM 恒为 ~50 行。Rust 51 passed、前端 69 passed。
+- 2026-10-25 RFC-006 Task 6 补：监听事件以 `workspace:changed` 增量更新侧栏（`WorkspaceDelta` + `applyWorkspaceDelta`，正文修改不发事件）；降级查询改为 16 线程并行校验（10k 档从 689 ms 降到 183 ms），`bench_search --degraded` 可复现；NSIS `1.73 MiB`。
