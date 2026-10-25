@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": "all",
     "category": "Productivity",
     "shortDescription": "Local-first Markdown notes",
     "longDescription": "MD Studio is a local-first Markdown writing app. Open a folder, edit notes, preview GFM, and autosave to disk.",

@@ -97,6 +97,6 @@ src-tauri/src      Rust 文件系统边界 + 路径校验
 - 50k 工作区打开成本（本机 release，1,086 MiB 语料）：枚举 + stat 1,029 ms，IPC JSON 5.10 MB，`buildNoteTree` 149 ms；随后后台预热。侧栏 DOM 不随笔记数增长。
 - 搜索性能（本机 release，语料 27/216/1,086 MiB，2026-10-25 流式路径）：暖 p50 3.7 / 14.3 / 1,999.8 ms，p95 4.7 / 17.5 / 2,034.8 ms；10k 档首批结果 0.65 ms（p50，常见词 50 条命中）。50k 受 256 MB 预算限制，只缓存约 11.5k 篇，其余每查询回退读盘。`--no-snapshot` 可测磁盘路径。
 - 文件监听（RFC-006 Task 6 / ADR-009）：`notify` 递归监听工作区，300 ms 去抖后增量更新快照与文件树（新增/删除/改名），外部改动实测 300–400 ms 可见，正文修改不会触发树刷新。监听不可用或事件溢出时置 `Degraded`，此后每次查询前按 mtime+size 校验缓存正文：10k 档降级查询 p50 183 ms（校验约 169 ms），仍快于完整磁盘扫描的 755 ms，但明显慢于就绪态的 14.6 ms。状态栏常驻显示快照三态（预热中 / 搜索缓存 / 已降级）与缓存大小。`bench_search --degraded` 可复现该档位。
-- 当前只验证 Windows；CI 跨平台矩阵尚未建立。
+- Windows 打包并实测可运行；CI 在 `windows-latest` / `ubuntu-latest` / `macos-latest` 三个 runner 上跑 Rust 测试，前端测试与文档门禁走 Ubuntu（macOS 因 FSEvents 与另外两家的语义差异暂不阻塞）。macOS / Linux 安装包尚未产出。
 
 完整清单与收尾标准见 [`docs/backlog.md`](docs/backlog.md)。

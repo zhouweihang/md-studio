@@ -12,6 +12,8 @@
 - **2026-10-23 RFC-004 闭环**：系统回收站删除 + 撤销 toast 通过；前端 30 passed、Rust 21 passed、typecheck/build/NSIS 1.52 MiB/docs PASS。
 - **2026-10-23 RFC-005 闭环**：搜索命中高亮 + 大工作区性能测试通过；前端 36 passed、Rust 22 passed（1,001 篇 330.97ms）、typecheck/build/NSIS 1.52 MiB/docs PASS。
 - **2026-10-23 RFC-006 文档落位**：性能评估 + 7 轮访谈结论固化为 spec；RFC-006、ADR-007~009、plan、B4 区块完成；门禁 PASS。代码未开始，L0~L3 由 B4 区块统一跟踪。
+- **2026-10-25 RFC-006 代码闭环**：B4 区块除 L3 评估外的八项全部完成（快照/LRU、并行、流式、监听、50k 虚拟化、基准门禁）；Rust 51 passed、前端 69 passed。
+- **2026-10-25 公开仓库与三平台 CI**：`github.com/zhouweihang/md-studio` 转为 Public；Rust 测试矩阵覆盖 Windows / Ubuntu / macOS（macOS 非阻塞），连同前端测试/构建与文档门禁五个 job 全绿（`2de6ae8`）；本机 release 安装包实测可启动。
 
 ## B1. 产品能力遗留（MVP 之外）
 
@@ -32,7 +34,7 @@
 | B2-1 | 原子写入 | `notes.rs` 计划用 `fs::write` | 写入中断可能留下截断文件 | 同目录临时文件 + rename；Windows 覆盖策略单测 |
 | ~~B2-2~~ | UI 组件测试 | `src/ui/App.test.tsx`、`src/ui/NoteDialog.test.tsx` | **Completed 2026-10-23**：Testing Library 共 13 个 UI 用例（App 10 + NoteDialog 3），覆盖空态、打开/编辑/预览、文件名过滤、内容命中高亮、关闭前 flush、冲突横幅/覆盖/重载、删除确认与回收站撤销、重命名、Escape，以及「新建 → 出现在树 → 打开为空编辑器」 | 引入 Testing Library，覆盖空态、搜索、新建、保存失败提示 |
 | ~~B2-3~~ | 文档门禁进 CI | `.github/workflows/ci.yml` 的 `docs` job | **Completed 2026-10-23**：push/PR 自动执行 `node scripts/check-eng-docs.cjs` | CI 在 PR 上运行 `bun run check:docs`，失败阻断合并 |
-| B2-4 | 跨平台路径测试 | 仅在 Windows 开发 | macOS/Linux 未验证 | CI 矩阵跑 `cargo test` 与 `bun run test` |
+| ~~B2-4~~ | 跨平台路径测试 | `.github/workflows/ci.yml` | **Completed 2026-10-25（部分）**：Rust 测试矩阵覆盖 `windows-latest` / `ubuntu-latest` / `macos-latest`，前端测试与构建在 Ubuntu；macOS 仍为 `continue-on-error`（FSEvents 去抖语义待观察），因此只有 Windows/Linux 阻断 | CI 矩阵跑 `cargo test` 与 `bun run test` |
 | ~~B2-5~~ | 搜索性能基线 | RFC-005 §4.2；ADR-004 | **Completed 2026-10-23**：1,001 篇笔记搜索实测 330.97ms（debug），测试断言 <10s 并打印耗时。RFC-006 将用三档基准与分机器基线取代单一护栏（见搜索基准条目） | 1,000 篇工作区有可重复耗时断言，数量级退化会被发现 |
 
 ## B3. 环境与依赖
@@ -55,3 +57,11 @@
 | ~~B4-7~~ | 50k 上限 + 侧栏虚拟化 | RFC-006 §4.7；REQ-028 | **Completed 2026-10-25**：`MAX_NOTES` 50,000 与限流单测；侧栏固定 24 px 行高窗口化（overscan 20、`ResizeObserver`、`viewportHeight` 可注入），目录默认折叠，搜索只渲染匹配；50k 枚举 1,029 ms、IPC 5.10 MB、树构建 149 ms，DOM 恒为 ~50 行（未触发 2 s 懒加载）；`Sidebar` 6 条用例覆盖窗口、滚动、折叠、搜索与键盘 | 50k 工作区可打开、可搜索；树虚拟化；键盘与无障碍不回归 |
 | ~~B4-8~~ | 基准脚本 + 基线门禁 | RFC-006 §10；REQ-030 | **Completed 2026-10-23，基线于 2026-10-24 随 L2 重采**：语料生成器、`bench_search`（`--no-snapshot` 可复现磁盘路径）、编排脚本与基线入库（暖 p50 1k 4.1 ms、10k 19.8 ms、50k 2.51 s）；`check-search-perf.mjs` 按中位数 ≤1.2×、p95 ≤2× 判定，PASS/FAIL 两条路径已自检 | 1k/10k/50k 可复现；基线 JSON 入库；1.2× 中位数 / 2× p95 可判定 |
 | B4-9 | L3 触发评估（ADR-010） | spec §5 L3 | 未开始 | 触发条件成文，附候选对比维度；不实现索引 |
+
+## B5. 发布工程
+
+| ID | 项 | 说明 | 收尾标准 |
+|---|---|---|---|
+| B5-1 | 版本号与发布节奏 | **策略已裁决 2026-10-25（方案 ②）**：应用版本走产品语义化 `0.x`，`0.1.0` 即首个公开版本，不随 RFC 阶段号跳动；RFC-001~006 的 `Target`（`v0.1.0`~`v0.6.0`）只是内部开发台阶，不改写 `package.json` / `tauri.conf.json`。剩余：仓库仍无 tag 与 Release | 打 `v0.1.0` tag 并发布 Release，挂上 NSIS 安装包与变更说明 |
+| B5-2 | 代码签名 | NSIS 安装包未签名，SmartScreen 报「未知发布者」 | 取得证书并在 `tauri.conf.json` 配置签名，或明确放弃并在 README 写明 |
+| B5-3 | macOS / Linux 打包 | `bundle.targets` 只有 `nsis` | 产出 `.dmg` 与 `.AppImage`/`.deb`，或明确只支持 Windows |

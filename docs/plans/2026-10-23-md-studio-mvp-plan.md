@@ -6,7 +6,7 @@
 
 **Goal:** 交付一个可安装的 Tauri 桌面 Markdown 笔记应用：选择本地文件夹、浏览/搜索、编辑、GFM 预览、700ms 自动保存，并有可重复的测试与文档门禁。
 
-**Status:** MVP 已实现并验证（前端 21 passed、Rust 7 passed、typecheck、前端构建、NSIS 1.50 MiB、文档门禁 PASS）。提交步骤未执行：本目录尚未初始化 Git。
+**Status:** MVP 已实现并验证（前端 21 passed、Rust 7 passed、typecheck、前端构建、NSIS 1.50 MiB、文档门禁 PASS）。执行本计划时目录尚未初始化 Git，因此各 Task 的「提交」步骤保持未勾选：2026-10-23 初始化仓库后，整棵树随首批提交入库，没有按 Task 拆分提交。
 
 ---
 

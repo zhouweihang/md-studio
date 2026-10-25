@@ -193,8 +193,8 @@ flowchart TB
 | RFC-005 REQ-021；ADR-004 | `search_notes_blocking` 大工作区耗时 | Rust 单测 |
 | RFC-006 REQ-022~025；ADR-007 | SearchSnapshot、LRU、预热状态机 | `search.rs` 单测（20 个含快照/预热）+ `bench_search` |
 | RFC-006 REQ-026；ADR-008 | `SearchEvent` 流式契约、`search_cancel`、`request_id` | `search.rs` 契约测试（批次上限、唯一 Done、取消）+ `noteRepository.test.ts` + `App.test.tsx` |
-| RFC-006 REQ-027；ADR-009 | Watcher、mtime 兜底、手动对账 | 计划：临时目录集成测试 |
-| RFC-006 REQ-028~030 | 50k 上限、侧栏虚拟化、基准门禁 | 计划：50k 基准 + UI 测试 |
+| RFC-006 REQ-027；ADR-009 | Watcher、mtime 兜底、手动对账、`workspace:changed` 增量 | `watcher.rs` 临时目录集成测试 + `src/core/notes.test.ts` 增量用例 |
+| RFC-006 REQ-028~030 | `MAX_NOTES` 50k、侧栏虚拟化、基准门禁 | `Sidebar` 6 条用例 + `bench_search` + `check-search-perf.mjs` |
 
 ## 6. 变更日志
 
@@ -215,3 +215,4 @@ flowchart TB
 - 2026-10-25 RFC-006 Task 5/6：`search_notes` 改为 Channel 流式并新增 `search_cancel`；`watcher.rs` 落地 notify 监听（300 ms 去抖、磁盘现状归约、`Degraded` + mtime+size 校验）；状态栏新增快照三态与缓存大小。Rust 49 passed、前端 55 passed。
 - 2026-10-25 RFC-006 Task 7：侧栏改为 24 px 固定行高窗口化（overscan 20、`ResizeObserver`、`viewportHeight` 可注入），目录默认折叠，搜索展开匹配；50k 枚举 1,029 ms、IPC 5.10 MB、树构建 149 ms，DOM 恒为 ~50 行。Rust 51 passed、前端 69 passed。
 - 2026-10-25 RFC-006 Task 6 补：监听事件以 `workspace:changed` 增量更新侧栏（`WorkspaceDelta` + `applyWorkspaceDelta`，正文修改不发事件）；降级查询改为 16 线程并行校验（10k 档从 689 ms 降到 183 ms），`bench_search --degraded` 可复现；NSIS `1.73 MiB`。
+- 2026-10-25 CI 跨平台：Rust 测试矩阵扩到 `windows-latest` / `ubuntu-latest` / `macos-latest`（macOS 非阻塞）；`rust-toolchain.toml` 固定 `stable-x86_64-pc-windows-msvc` 供 Windows 打包，非 Windows runner 在 rustup 步骤前删除该文件；仓库公开后三平台 Rust 测试、前端测试/构建与文档门禁五个 job 一次全绿（`2de6ae8`）。
